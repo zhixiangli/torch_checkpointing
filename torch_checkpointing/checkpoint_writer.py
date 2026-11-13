@@ -325,7 +325,7 @@ class CheckpointWriter:
             logger.info("Moving checkpoint to final directory")
             self._storage.rename(tmp_dir_path, final_path, is_directory=True)
             if metadata:
-                self._write_metadata(final_path, metadata)
+                self._publish_metadata(final_path, metadata)
             logger.info(
                 "Finished moving checkpoint to final directory",
                 extra=event_logger(
@@ -498,3 +498,16 @@ class CheckpointWriter:
         if serialized_distributed_metadata:
             metadata_path = dir_path / METADATA_FILE_NAME
             self._storage.write(metadata_path, serialized_distributed_metadata)
+
+    def _publish_metadata(self, dir_path: Path, serialized_metadata: bytes) -> None:
+        """Make ``dir_path/metadata.pkl`` appear whole or not at all.
+
+        The metadata file marks a checkpoint directory complete, so readers
+        trust it as soon as it exists. Written in place, it is visible while
+        partly written: a POSIX file from its creat(), an unfinalized object on
+        a zonal bucket. It is staged under another name and renamed onto the
+        marker, a file replace that every backend commits in one step.
+        """
+        staged_path = dir_path / f".{METADATA_FILE_NAME}.tmp"
+        self._storage.write(staged_path, serialized_metadata)
+        self._storage.rename(staged_path, dir_path / METADATA_FILE_NAME)

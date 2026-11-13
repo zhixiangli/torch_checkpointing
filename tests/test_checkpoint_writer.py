@@ -534,7 +534,8 @@ class TestCheckpointWriter(TestCase):
         original_rename = LocalFileSystemStorage.rename
 
         def rename(storage, src_path, dst_path, *args, **kwargs):
-            staged_at_rename.append((Path(src_path) / METADATA_FILE_NAME).exists())
+            if Path(src_path).is_dir():
+                staged_at_rename.append((Path(src_path) / METADATA_FILE_NAME).exists())
             original_rename(storage, src_path, dst_path, *args, **kwargs)
 
         writer = self._writer(
@@ -554,7 +555,38 @@ class TestCheckpointWriter(TestCase):
         self.assertEqual(
             (final_path / METADATA_FILE_NAME).read_bytes(), b"distributed-metadata"
         )
+        self.assertEqual(
+            sorted(p.name for p in final_path.iterdir()),
+            ["first.bin", "metadata.bin", METADATA_FILE_NAME, "second.bin"],
+        )
         self.assertFalse(tmp_path.exists())
+
+    def test_interrupted_metadata_publish_leaves_no_marker(self):
+        """A crash while the completeness marker is written must not publish it.
+
+        metadata.pkl marks the directory complete, so a reader trusts it as
+        soon as it exists. Written in place at the final path, a process killed
+        mid-write leaves a truncated marker that a reader selects and then
+        fails to unpickle.
+        """
+        final_path = Path(self.temp_dir) / "checkpoint_0006500"
+        original_write = LocalFileSystemStorage.write
+
+        def write(storage, path, data):
+            if Path(path).parent == final_path:
+                # Land part of the bytes and die, as a killed process would.
+                Path(path).write_bytes(bytes(memoryview(data))[:1])
+                raise OSError("killed while writing")
+            original_write(storage, path, data)
+
+        writer = self._writer(_ConcurrencyProbe(1), barrier_config=_NoopBarrierConfig())
+        info = self._raw_checkpoint_info()
+        info.serialized_distributed_metadata = b"distributed-metadata"
+        with mock.patch.object(LocalFileSystemStorage, "write", write):
+            with pytest.raises(OSError, match="killed while writing"):
+                writer.write(str(final_path), info)
+
+        self.assertFalse((final_path / METADATA_FILE_NAME).exists())
 
     def test_default_barrier_commits_through_a_temp_dir(self):
         """Test that a writer left at its defaults commits atomically."""
