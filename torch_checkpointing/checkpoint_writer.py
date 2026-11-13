@@ -322,6 +322,12 @@ class CheckpointWriter:
             # missing shards.
             if stage_metadata:
                 self._storage.delete(tmp_dir_path / METADATA_FILE_NAME)
+                if (
+                    not save_items
+                    and self._storage.isdir(tmp_dir_path)
+                    and not self._storage.ls(tmp_dir_path)
+                ):
+                    self._storage.rmdir(tmp_dir_path)
             logger.info("Moving checkpoint to final directory")
             if self._storage.exists(tmp_dir_path):
                 self._storage.rename(tmp_dir_path, final_path, is_directory=True)

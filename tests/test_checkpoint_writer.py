@@ -596,9 +596,9 @@ class TestCheckpointWriter(TestCase):
     def test_write_refuses_a_metadata_only_checkpoint(self):
         """A checkpoint with no files from any rank has nothing to commit.
 
-        Creating final_path directly when tmp_dir_path is absent would bypass
-        rename's destination check and overwrite metadata.pkl in an existing
-        checkpoint directory.
+        Creating final_path directly when tmp_dir_path is absent, or renaming
+        an empty tmp_dir_path created only to stage metadata for a
+        pre_finalize_callback, would commit a shard-less checkpoint.
         """
         memory_root = Path(f"/checkpoint-writer-{os.getpid()}-{id(self)}")
         for storage_config, root in (
@@ -611,34 +611,49 @@ class TestCheckpointWriter(TestCase):
                 memory_root,
             ),
         ):
-            with self.subTest(storage=type(storage_config).__name__):
-                writer = CheckpointWriter(
-                    CheckpointWriterArgs(
-                        config=CheckpointWriterConfig(
-                            barrier_config=_NoopBarrierConfig()
-                        ),
-                        rank_info=self.rank_info,
-                        storage_config=storage_config,
+            for pre_finalize_callback in (None, lambda _args: None):
+                with self.subTest(
+                    storage=type(storage_config).__name__,
+                    staged=pre_finalize_callback is not None,
+                ):
+                    writer = CheckpointWriter(
+                        CheckpointWriterArgs(
+                            config=CheckpointWriterConfig(
+                                barrier_config=_NoopBarrierConfig()
+                            ),
+                            rank_info=self.rank_info,
+                            storage_config=storage_config,
+                            pre_finalize_callback=pre_finalize_callback,
+                        )
                     )
-                )
-                storage = writer._storage
-                info = CheckpointWriteInfo(checkpoint_items={})
-                info.serialized_distributed_metadata = b"distributed-metadata"
+                    storage = writer._storage
+                    info = CheckpointWriteInfo(checkpoint_items={})
+                    info.serialized_distributed_metadata = b"distributed-metadata"
 
-                occupied_path = root / "checkpoint_0007000"
-                storage.mkdir(occupied_path)
-                storage.write(occupied_path / METADATA_FILE_NAME, b"existing")
-                with pytest.raises(FileNotFoundError, match="metadata alone"):
-                    writer.write(str(occupied_path), info)
-                self.assertEqual(
-                    storage.read(occupied_path / METADATA_FILE_NAME),
-                    b"existing",
-                )
+                    occupied_path = root / "checkpoint_0007000"
+                    storage.mkdir(occupied_path)
+                    storage.write(occupied_path / METADATA_FILE_NAME, b"existing")
+                    with pytest.raises(FileNotFoundError, match="metadata alone"):
+                        writer.write(str(occupied_path), info)
+                    self.assertEqual(
+                        storage.read(occupied_path / METADATA_FILE_NAME),
+                        b"existing",
+                    )
+                    self.assertFalse(
+                        storage.exists(
+                            root / f"{DEFAULT_TEMP_DIR_PREFIX}{occupied_path.name}"
+                        )
+                    )
 
-                fresh_path = root / "checkpoint_0008000"
-                with pytest.raises(FileNotFoundError, match="metadata alone"):
-                    writer.write(str(fresh_path), info)
-                self.assertFalse(storage.exists(fresh_path / METADATA_FILE_NAME))
+                    fresh_path = root / "checkpoint_0008000"
+                    with pytest.raises(FileNotFoundError, match="metadata alone"):
+                        writer.write(str(fresh_path), info)
+                    self.assertFalse(storage.exists(fresh_path))
+                    self.assertFalse(
+                        storage.exists(
+                            root / f"{DEFAULT_TEMP_DIR_PREFIX}{fresh_path.name}"
+                        )
+                    )
         FsspecStorageConfig(protocol="memory").create_storage().rmdir(memory_root)
 
     def test_default_barrier_commits_through_a_temp_dir(self):
