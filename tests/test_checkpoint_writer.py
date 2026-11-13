@@ -478,6 +478,7 @@ class TestCheckpointWriter(TestCase):
             pre_finalize_callback=mock_pre_finalize_callback,
             finalize_callback=mock_finalize_callback,
         )
+        writer._barrier = mock.Mock()
         writer.write(str(final_path), self._raw_checkpoint_info())
         self.assertEqual(mock_pre_finalize_callback.call_count, 1)
         self.assertEqual(
@@ -485,6 +486,9 @@ class TestCheckpointWriter(TestCase):
         )
         self.assertEqual(mock_finalize_callback.call_count, 1)
         self.assertEqual(mock_finalize_callback.call_args.args[0].path, str(final_path))
+        # Once before rank 0 commits, and once more so this rank does not
+        # return, or finalize, before the checkpoint exists at its final path.
+        self.assertEqual(writer._barrier.execute_barrier.call_count, 2)
 
         # Not renamed -- temp dir still exists
         self.assertFalse(final_path.exists())
@@ -788,19 +792,28 @@ class TestCheckpointWriter(TestCase):
         barrier = mock.Mock()
         barrier.execute_barrier.side_effect = lambda _timeout: events.append("barrier")
         writer._barrier = barrier
+        original_rename = LocalFileSystemStorage.rename
+
+        def rename(storage, src_path, dst_path, *args, **kwargs):
+            if Path(src_path) == temporary_path:
+                events.append("commit")
+            original_rename(storage, src_path, dst_path, *args, **kwargs)
 
         items = {
             key: CheckpointItem(value=value, layout=None)
             for key, value in self.state_dict.items()
         }
-        writer.write(
-            str(checkpoint_path),
-            CheckpointWriteInfo(checkpoint_items=items),
-        )
+        with mock.patch.object(LocalFileSystemStorage, "rename", rename):
+            writer.write(
+                str(checkpoint_path),
+                CheckpointWriteInfo(checkpoint_items=items),
+            )
 
+        # The second barrier holds every rank until rank 0 has committed, so no
+        # rank finalizes or returns before the final path exists.
         self.assertEqual(
             events,
-            ["pre_write", "pre_finalize", "barrier", "finalize"],
+            ["pre_write", "pre_finalize", "barrier", "commit", "barrier", "finalize"],
         )
         self.assertFalse(temporary_path.exists())
 
