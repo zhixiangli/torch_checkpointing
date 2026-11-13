@@ -334,6 +334,15 @@ class CheckpointWriter:
                 ),
             )
 
+        # Every rank waits for rank 0's commit, so none runs the finalize
+        # callback or returns before the checkpoint exists at final_path. If
+        # rank 0 fails to commit, the others fail at this barrier instead of
+        # reporting success.
+        if self._args.config.write_to_temp_dir and self._barrier is not None:
+            self._barrier.execute_barrier(
+                self._args.config.checkpoint_write_barrier_timeout_sec,
+            )
+
         # Execute finalize callback if available
         if self._args.finalize_callback is not None:
             logger.debug(f"Executing finalize callback for {path}")
