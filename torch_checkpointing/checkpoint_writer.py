@@ -237,15 +237,21 @@ class CheckpointWriter:
 
         self._write_keys(save_items, state_dict)
 
-        # Write metadata directly from serialized string if available (rank0 only)
-        if self._args.rank_info.role_rank == 0:
+        metadata = checkpoint_info.serialized_distributed_metadata
+        # On the commit path metadata.pkl is published at final_path after the
+        # rename, so the temp dir holds a copy only for a pre-finalize callback
+        # to read.
+        stage_metadata = bool(metadata) and (
+            not self._args.config.write_to_temp_dir
+            or self._args.pre_finalize_callback is not None
+        )
+        if self._args.rank_info.role_rank == 0 and stage_metadata:
+            if not save_items:
+                self._storage.mkdir(tmp_dir_path)
             logger.info(
                 "Writing metadata to checkpoint directory",
             )
-            self._write_metadata(
-                tmp_dir_path,
-                checkpoint_info.serialized_distributed_metadata,
-            )
+            self._write_metadata(tmp_dir_path, metadata)
             logger.info(
                 "Done writing metadata to checkpoint directory",
                 extra=event_logger(
@@ -308,13 +314,30 @@ class CheckpointWriter:
 
         # rename back to original path for atomicity. It's important this is done
         # immediately after the barrier to ensure all ranks have finished writing
-        if (
-            self._args.config.write_to_temp_dir
-            and self._storage.exists(tmp_dir_path)
-            and self._args.rank_info.role_rank == 0
-        ):
+        if self._args.config.write_to_temp_dir and self._args.rank_info.role_rank == 0:
+            # The metadata file is what marks a checkpoint directory complete,
+            # so it lands last. On a store without a real directory rename the
+            # rename is a per-object move, and metadata.pkl sorts and finishes
+            # ahead of the shards: a crash midway would leave it next to
+            # missing shards.
+            if stage_metadata:
+                self._storage.delete(tmp_dir_path / METADATA_FILE_NAME)
+                if (
+                    not save_items
+                    and self._storage.isdir(tmp_dir_path)
+                    and not self._storage.ls(tmp_dir_path)
+                ):
+                    self._storage.rmdir(tmp_dir_path)
             logger.info("Moving checkpoint to final directory")
-            self._storage.rename(tmp_dir_path, final_path, is_directory=True)
+            if self._storage.exists(tmp_dir_path):
+                self._storage.rename(tmp_dir_path, final_path, is_directory=True)
+            elif metadata:
+                raise FileNotFoundError(
+                    f"No rank wrote a file to {tmp_dir_path}: a checkpoint of "
+                    "metadata alone has nothing to commit."
+                )
+            if metadata:
+                self._publish_metadata(final_path, metadata)
             logger.info(
                 "Finished moving checkpoint to final directory",
                 extra=event_logger(
@@ -487,3 +510,16 @@ class CheckpointWriter:
         if serialized_distributed_metadata:
             metadata_path = dir_path / METADATA_FILE_NAME
             self._storage.write(metadata_path, serialized_distributed_metadata)
+
+    def _publish_metadata(self, dir_path: Path, serialized_metadata: bytes) -> None:
+        """Make ``dir_path/metadata.pkl`` appear whole or not at all.
+
+        The metadata file marks a checkpoint directory complete, so readers
+        trust it as soon as it exists. Written in place, it is visible while
+        partly written: a POSIX file from its creat(), an unfinalized object on
+        a zonal bucket. It is staged under another name and renamed onto the
+        marker, a file replace that every backend commits in one step.
+        """
+        staged_path = dir_path / f".{METADATA_FILE_NAME}.tmp"
+        self._storage.write(staged_path, serialized_metadata)
+        self._storage.rename(staged_path, dir_path / METADATA_FILE_NAME)
