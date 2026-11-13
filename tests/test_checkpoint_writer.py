@@ -46,6 +46,7 @@ from torch_checkpointing.storage.filesystem import (
     LocalFileSystemStorage,
     LocalFileSystemStorageConfig,
 )
+from torch_checkpointing.storage.fsspec_storage import FsspecStorageConfig
 from torch_checkpointing.types import RankInfo
 
 
@@ -591,6 +592,54 @@ class TestCheckpointWriter(TestCase):
                 writer.write(str(final_path), info)
 
         self.assertFalse((final_path / METADATA_FILE_NAME).exists())
+
+    def test_write_refuses_a_metadata_only_checkpoint(self):
+        """A checkpoint with no files from any rank has nothing to commit.
+
+        Creating final_path directly when tmp_dir_path is absent would bypass
+        rename's destination check and overwrite metadata.pkl in an existing
+        checkpoint directory.
+        """
+        memory_root = Path(f"/checkpoint-writer-{os.getpid()}-{id(self)}")
+        for storage_config, root in (
+            (
+                LocalFileSystemStorageConfig(use_direct_io=False),
+                Path(self.temp_dir),
+            ),
+            (
+                FsspecStorageConfig(protocol="memory"),
+                memory_root,
+            ),
+        ):
+            with self.subTest(storage=type(storage_config).__name__):
+                writer = CheckpointWriter(
+                    CheckpointWriterArgs(
+                        config=CheckpointWriterConfig(
+                            barrier_config=_NoopBarrierConfig()
+                        ),
+                        rank_info=self.rank_info,
+                        storage_config=storage_config,
+                    )
+                )
+                storage = writer._storage
+                info = CheckpointWriteInfo(checkpoint_items={})
+                info.serialized_distributed_metadata = b"distributed-metadata"
+
+                occupied_path = root / "checkpoint_0007000"
+                storage.mkdir(occupied_path)
+                storage.write(occupied_path / METADATA_FILE_NAME, b"existing")
+                with pytest.raises(FileNotFoundError, match="metadata alone"):
+                    writer.write(str(occupied_path), info)
+                self.assertEqual(
+                    storage.read(occupied_path / METADATA_FILE_NAME),
+                    b"existing",
+                )
+
+                fresh_path = root / "checkpoint_0008000"
+                with pytest.raises(FileNotFoundError, match="metadata alone"):
+                    writer.write(str(fresh_path), info)
+                self.assertFalse(storage.exists(fresh_path / METADATA_FILE_NAME))
+        FsspecStorageConfig(protocol="memory").create_storage().rmdir(memory_root)
 
     def test_default_barrier_commits_through_a_temp_dir(self):
         """Test that a writer left at its defaults commits atomically."""

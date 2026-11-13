@@ -361,7 +361,10 @@ and `remap_path` returns the full URI.
 
 **`storage_options`** are passed to the driver's filesystem class, for
 credentials or endpoints. The config must stay picklable, because the async
-save subprocess rebuilds the storage from it.
+save subprocess rebuilds the storage from it. On GCS zonal buckets, `gcsfs`
+leaves objects unfinalized (appendable) on close by default; pass
+`storage_options={"finalize_on_close": True}` if downstream consumers require
+finalized objects.
 
 **Commit is only as atomic as the driver's move.** `rename` checks the
 destination and then calls the driver's move. Where that move is a single
