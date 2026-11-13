@@ -365,9 +365,12 @@ save subprocess rebuilds the storage from it.
 
 **Commit is only as atomic as the driver's move.** `rename` checks the
 destination and then calls the driver's move. Where that move is a single
-directory rename, it is atomic. On a flat object store each object is copied
-and then deleted, so a crash midway can leave the final checkpoint directory
-partly written.
+directory rename, it is atomic: on GCS, a bucket with hierarchical namespace
+(including zonal buckets) renames the folder in one request. On a flat object
+store each object is copied and then deleted, so a crash midway can leave the
+final checkpoint directory partly written. The writer adds `metadata.pkl` to
+the final directory only after the rename, so a partly written directory has no
+metadata and reads as incomplete.
 
 **The listing cache is turned off.** Some drivers cache directory listings per
 client and trust them when looking a path up, but other ranks and the save

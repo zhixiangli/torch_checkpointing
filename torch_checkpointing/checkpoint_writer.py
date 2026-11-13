@@ -313,8 +313,19 @@ class CheckpointWriter:
             and self._storage.exists(tmp_dir_path)
             and self._args.rank_info.role_rank == 0
         ):
+            # The metadata file is what marks a checkpoint directory complete,
+            # so it lands last. On a store without a real directory rename the
+            # rename is a per-object move, and metadata.pkl sorts and finishes
+            # ahead of the shards: a crash midway would leave it next to
+            # missing shards. It stays in the temp dir until now for
+            # pre-finalize callbacks.
+            metadata = checkpoint_info.serialized_distributed_metadata
+            if metadata:
+                self._storage.delete(tmp_dir_path / METADATA_FILE_NAME)
             logger.info("Moving checkpoint to final directory")
             self._storage.rename(tmp_dir_path, final_path, is_directory=True)
+            if metadata:
+                self._write_metadata(final_path, metadata)
             logger.info(
                 "Finished moving checkpoint to final directory",
                 extra=event_logger(
