@@ -400,9 +400,14 @@ metadata. An explicit `LayoutInfo.file_path` remains exact. A fixed shared path
 is safe only when the caller selects one rank to write it.
 
 Metadata is written by `role_rank == 0` only. When a barrier is configured, the
-writer stages files under a `tmp_` directory, waits for all ranks at the barrier,
-then renames to the final path for atomicity; `pre_finalize_callback` runs before
-the barrier and `finalize_callback` after. All write hooks accept a
+writer stages files under a `tmp_` directory (rank 0 first clears one left by an
+interrupted save, behind a barrier), waits for all ranks at a barrier, and then
+rank 0 renames the directory onto the final path and publishes `metadata.pkl`
+there last, so a rename cut short never looks complete. A final barrier holds
+every rank until that commit is done. With `replace_existing=True`, rank 0
+deletes the checkpoint already at the final path just before the rename.
+`pre_finalize_callback` runs before the write barrier and `finalize_callback`
+after the final one. All write hooks accept a
 `CallbackArgs` object containing the phase path, writer storage, and event logger.
 `pre_write_callback` runs with the final destination before any files are written.
 With no barrier configured, the writer

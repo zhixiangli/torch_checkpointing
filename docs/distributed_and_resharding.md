@@ -201,7 +201,9 @@ class CheckpointWriterConfig:
         default_factory=DefaultStoreBarrierConfig
     )
     file_write_max_threads: int = 1
+    temp_dir_prefix: str = DEFAULT_TEMP_DIR_PREFIX  # "tmp_"
     write_to_temp_dir: bool = True
+    replace_existing: bool = False
 ```
 
 `DefaultStoreBarrierConfig` is the default because it costs nothing to hold: it
@@ -213,21 +215,36 @@ commit too.
 By default, inside `CheckpointWriter.write()` the ordering is:
 
 1. Run `pre_write_callback` with the final destination; raising aborts the write.
-2. Write all shard files (and, on `role_rank == 0`, the metadata file) into a
-   temporary directory.
-3. Run `pre_finalize_callback` (see below).
-4. If a barrier is configured, `execute_barrier(...)` — wait for every rank to
-   finish writing.
-5. On `role_rank == 0`, atomically rename the temporary directory to the final
-   path.
-6. Run `finalize_callback`.
+2. On `role_rank == 0`, remove a temporary directory left by an interrupted
+   save of the same path, then wait for every rank at the barrier so none
+   writes into it before it is cleared.
+3. Write all shard files into the temporary directory.
+4. Run `pre_finalize_callback` (see below).
+5. Wait for every rank at the barrier, so every shard is written.
+6. On `role_rank == 0`, commit: with `replace_existing=True`, delete the
+   checkpoint already at the final path (its `metadata.pkl` first); rename the
+   temporary directory onto the final path; then publish `metadata.pkl` there,
+   staged as `.metadata.pkl.tmp` and renamed into place.
+7. Wait for every rank at the barrier, so no rank returns, or reports success,
+   before rank 0 has committed. If rank 0's commit fails, the other ranks fail
+   here.
+8. Run `finalize_callback`.
+
+`metadata.pkl` marks a checkpoint directory complete, so it lands last: on a
+backend whose directory rename moves one object at a time, a rename cut short
+leaves a directory without it, which readers treat as incomplete. All three
+barriers use `checkpoint_write_barrier_timeout_sec`.
+
+If `write()` raises on a writer whose role has more than one rank, the ranks may
+have stopped at different barriers, so that writer refuses any further write;
+build a new writer (or saver) to save again.
 
 The temporary-directory-then-rename dance is what makes a checkpoint atomic:
 readers never observe a half-written directory.
 
 ### Disabling the temporary directory
 
-`write_to_temp_dir` decides whether files are staged in a temporary directory and renamed in step 5. It defaults to
+`write_to_temp_dir` decides whether files are staged in a temporary directory and renamed in step 6. It defaults to
 `True`; set it to `False` and every rank writes directly to the final path. The
 barrier and callbacks still run as above.
 
@@ -304,10 +321,11 @@ in `torch_checkpointing.checkpoint_writer` and contains `path`, the writer's
   It receives the final destination path; raising aborts that rank's write.
   Configure this hook on `CheckpointWriterArgs`.
 - **`pre_finalize_callback`** runs on every writing rank after all files are
-  written but before the barrier. Its path is the temporary directory when
+  written but before the write barrier. Its path is the temporary directory when
   `write_to_temp_dir=True`, otherwise the final directory.
-- **`finalize_callback`** runs on every writing rank after its barrier and
-  rename step, with the final path. Only rank 0 performs the rename.
+- **`finalize_callback`** runs on every writing rank with the final path, after
+  rank 0 has committed (all ranks wait for it at the final barrier). Only rank 0
+  performs the rename.
 
 The two finalize hooks can also be passed to either saver factory:
 
