@@ -65,6 +65,13 @@ class CheckpointWriterConfig:
             directory and rename it onto the final path once every rank has finished.
             Defaults to True. If false, writer will write directly to the final path.
             Requires a barrier to be configured when True.
+        replace_existing: Replace whatever is at the destination when committing.
+            Rank 0 deletes the destination (removing ``metadata.pkl`` first) after
+            every rank has written and passed the write barrier, then renames the
+            staging directory onto it. A failure before that point leaves the
+            existing destination untouched. The delete and the rename are separate
+            steps, so a crash between them leaves no checkpoint at the destination.
+            Requires ``write_to_temp_dir=True``.
     """
 
     checkpoint_write_barrier_timeout_sec: int = 600
@@ -74,6 +81,7 @@ class CheckpointWriterConfig:
     file_write_max_threads: int = 1
     temp_dir_prefix: str = DEFAULT_TEMP_DIR_PREFIX
     write_to_temp_dir: bool = True
+    replace_existing: bool = False
 
     def __post_init__(self) -> None:
         if self.file_write_max_threads < 1:
@@ -83,6 +91,8 @@ class CheckpointWriterConfig:
             logger.warning(msg)
             warnings.warn(msg, stacklevel=2)
             self.write_to_temp_dir = False
+        if self.replace_existing and not self.write_to_temp_dir:
+            raise ValueError("replace_existing requires write_to_temp_dir=True")
         if self.write_to_temp_dir and not self.temp_dir_prefix:
             raise ValueError(
                 "temp_dir_prefix must be non-empty when writing to a temp dir"
@@ -357,6 +367,26 @@ class CheckpointWriter:
                     self._storage.rmdir(tmp_dir_path)
             logger.info("Moving checkpoint to final directory")
             if self._storage.exists(tmp_dir_path):
+                if self._args.config.replace_existing and self._storage.exists(
+                    final_path
+                ):
+                    if self._storage.isdir(final_path):
+                        logger.warning(
+                            "Replacing existing checkpoint directory %s.",
+                            final_path,
+                        )
+                        # The completeness marker leaves first, so an
+                        # interrupted recursive delete never leaves metadata.pkl
+                        # next to missing shards. On flat object stores the
+                        # prefix vanishes with its last object, so re-check
+                        # existence before rmdir.
+                        existing_marker = final_path / METADATA_FILE_NAME
+                        if self._storage.exists(existing_marker):
+                            self._storage.delete(existing_marker)
+                        if self._storage.exists(final_path):
+                            self._storage.rmdir(final_path)
+                    else:
+                        self._storage.rmdir(final_path)
                 self._storage.rename(tmp_dir_path, final_path, is_directory=True)
             elif metadata:
                 raise FileNotFoundError(

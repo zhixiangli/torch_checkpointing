@@ -137,7 +137,9 @@ exact. Every backend must implement this table:
 Two rules generate the table: the contents of `src_path` land *directly* at
 `dst_path` and never nested inside it, and an occupied destination raises instead
 of being merged into or deleted. Only file-onto-file is a replace, because the
-atomic-write callers ask for that by construction. A nested or merged commit is
+atomic-write callers ask for that by construction; callers that mean to replace
+an existing checkpoint directory use `CheckpointWriterConfig(replace_existing=True)`,
+which deletes explicitly before calling `rename`. A nested or merged commit is
 silent data corruption rather than a cosmetic difference, which is why this is
 spelled out rather than left to each backend's judgement.
 
@@ -369,8 +371,9 @@ finalized objects.
 **Commit is only as atomic as the driver's move.** On the staged-write path the
 sequence is: rank 0 removes any leftover staging directory from an interrupted
 save -> pre-write barrier -> every rank writes its shards -> pre-finalize
-callback -> write barrier -> rank 0 renames the staging directory onto the final
-path and publishes `metadata.pkl` -> post-commit barrier -> finalize callback.
+callback -> write barrier -> rank 0 optionally removes an existing destination
+(`replace_existing=True`), renames the staging directory onto the final path, and
+publishes `metadata.pkl` -> post-commit barrier -> finalize callback.
 `rename` checks the destination and then calls the driver's move. Where that
 move is a single directory rename, it is atomic: on GCS, a bucket with
 hierarchical namespace (including zonal buckets) renames the folder in one
@@ -380,7 +383,11 @@ crash midway can leave the final checkpoint directory partly written. Because
 directory has no metadata and reads as incomplete; and because it is written as
 `.metadata.pkl.tmp` and renamed into place, `metadata.pkl` is never visible
 half-written, not even on a zonal bucket, whose objects can be read before they
-are finalized.
+are finalized. When `replace_existing=True`, rank 0 deletes `metadata.pkl` first
+and then removes the destination directory before renaming, so a failure before
+the write barrier leaves the old checkpoint intact and an interrupted delete
+never leaves a marker next to missing shards; the delete and the rename are
+separate steps, so a crash between them leaves no checkpoint at the destination.
 
 **The listing cache is turned off.** Some drivers cache directory listings per
 client and trust them when looking a path up, but other ranks and the save
