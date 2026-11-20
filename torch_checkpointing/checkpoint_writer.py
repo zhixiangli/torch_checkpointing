@@ -219,6 +219,33 @@ class CheckpointWriter:
         final_path = Path(path)
         if self._args.config.write_to_temp_dir:
             tmp_dir_path = _temp_dir_path(final_path, self._args.config.temp_dir_prefix)
+            if self._args.rank_info.role_rank == 0 and self._storage.exists(
+                tmp_dir_path
+            ):
+                if self._storage.isdir(tmp_dir_path):
+                    logger.warning(
+                        "Removing leftover staging directory %s before writing.",
+                        tmp_dir_path,
+                    )
+                self._storage.rmdir(tmp_dir_path)
+            # Every rank waits here even when rank 0 found nothing: other ranks
+            # cannot know whether a leftover existed, and must not write into
+            # tmp_dir_path until rank 0 has cleared it.
+            assert self._barrier is not None
+            logger.info(
+                f"Waiting for all ranks at staging barrier with timeout {self._args.config.checkpoint_write_barrier_timeout_sec}s",
+                extra=event_logger(EventType.CHECKPOINT_BARRIER_START),
+            )
+            self._barrier.execute_barrier(
+                self._args.config.checkpoint_write_barrier_timeout_sec,
+            )
+            logger.info(
+                "All ranks passed staging barrier",
+                extra=event_logger(
+                    EventType.CHECKPOINT_BARRIER_END,
+                    metric_name=f"{self._metric_prefix}.execute.staging_barrier.latency_ms",
+                ),
+            )
         else:
             tmp_dir_path = final_path
 
