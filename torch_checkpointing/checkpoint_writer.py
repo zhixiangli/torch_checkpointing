@@ -49,7 +49,7 @@ class CheckpointWriterConfig:
 
     Attributes:
         checkpoint_write_barrier_timeout_sec: Maximum time in seconds to wait for all ranks
-            to reach the checkpoint barrier before timing out. Default is 600 seconds.
+            at each of the writer's barriers before timing out. Default is 600 seconds.
         barrier_config: Complete configuration for the synchronization barrier that
             commits the write. Defaults to ``DefaultStoreBarrierConfig``, which
             coordinates on the store the process group already has and costs a
@@ -178,6 +178,8 @@ class CheckpointWriter:
 
         # Create barrier from config
         self._barrier: Barrier | None = None
+        # Set once a write raises on a multi-rank writer; see write().
+        self._failed = False
         if args.config.barrier_config is not None:
             logger.info(
                 f"Starting: initializing barrier of checkpointing sub-process for rank {args.rank_info.global_rank}/{args.rank_info.global_world_size} "
@@ -213,7 +215,31 @@ class CheckpointWriter:
 
         Returns:
             Optional[Future[None]]: A future for tracking the write operation, if applicable.
+
+        Raises:
+            RuntimeError: If an earlier write on this multi-rank writer failed.
+                The ranks may then disagree on which barrier comes next, so a
+                retry could pass a barrier early and commit a checkpoint with
+                missing shards; build a new writer to save again.
         """
+        if self._failed:
+            raise RuntimeError(
+                "An earlier write failed on this rank, leaving its barriers out "
+                "of step with the other ranks; build a new writer to save again."
+            )
+        try:
+            return self._write(path, checkpoint_info)
+        except BaseException:
+            self._failed = (
+                self._barrier is not None and self._args.rank_info.role_world_size > 1
+            )
+            raise
+
+    def _write(
+        self,
+        path: str,
+        checkpoint_info: CheckpointWriteInfo,
+    ) -> Future[None] | None:
         event_logger = EventLogger()
         logger.debug(
             f"Writing checkpoint to {path} for rank {self._args.rank_info.global_rank}"

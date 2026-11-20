@@ -9,15 +9,19 @@ import os
 import shutil
 import tempfile
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch_checkpointing.checkpoint_writer as checkpoint_writer_module
 from torch.testing._internal.common_utils import run_tests, TestCase
 from torch_checkpointing.barriers import (
+    _TCPStoreConnectionInfo,
     Barrier,
     BarrierConfig,
     DefaultStoreBarrier,
@@ -748,6 +752,76 @@ class TestCheckpointWriter(TestCase):
         # The pre-existing checkpoint must be left untouched, not merged into or
         # replaced, and the staged data must not be nested underneath it.
         self.assertEqual(sorted(p.name for p in final_path.iterdir()), ["leftover.bin"])
+
+    def test_multi_rank_writer_refuses_a_retry_after_a_failed_write(self):
+        """A failed multi-rank write leaves the ranks at different barriers.
+
+        Rank 0's commit raises before the post-commit barrier, so rank 1 times
+        out there. Writing again with the same writers would let one rank pass
+        the next pre-write barrier early and commit a checkpoint with missing
+        shards, so both ranks must refuse the retry instead.
+        """
+        store = dist.TCPStore(
+            "localhost",
+            0,
+            world_size=1,
+            is_master=True,
+            timeout=timedelta(seconds=10),
+            wait_for_workers=False,
+        )
+        barrier_config = DefaultStoreBarrierConfig()
+        barrier_config._store_connection = _TCPStoreConnectionInfo(
+            host="localhost", port=store.port
+        )
+        occupied_path = Path(self.temp_dir) / "step-1"
+        occupied_path.mkdir()
+        (occupied_path / "old.bin").write_bytes(b"old")
+        retry_path = Path(self.temp_dir) / "step-2"
+
+        def save_twice(rank: int) -> list[BaseException]:
+            writer = CheckpointWriter(
+                CheckpointWriterArgs(
+                    config=CheckpointWriterConfig(
+                        checkpoint_write_barrier_timeout_sec=2,
+                        barrier_config=barrier_config,
+                    ),
+                    rank_info=RankInfo(
+                        global_rank=rank,
+                        global_world_size=2,
+                        role_rank=rank,
+                        role_world_size=2,
+                    ),
+                    storage_config=LocalFileSystemStorageConfig(use_direct_io=False),
+                )
+            )
+            info = CheckpointWriteInfo(
+                checkpoint_items={
+                    "shard": CheckpointItem(
+                        value=f"shard-{rank}".encode(),
+                        layout=LayoutInfo(f"shard_{rank}.bin", RawSerialization()),
+                    )
+                }
+            )
+            errors: list[BaseException] = []
+            for path in (occupied_path, retry_path):
+                try:
+                    writer.write(str(path), info)
+                except Exception as error:
+                    errors.append(error)
+            return errors
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            rank_0_errors, rank_1_errors = pool.map(save_twice, range(2))
+
+        self.assertIsInstance(rank_0_errors[0], FileExistsError)
+        self.assertIsInstance(rank_1_errors[0], dist.DistStoreError)
+        for errors in (rank_0_errors, rank_1_errors):
+            self.assertEqual(len(errors), 2)
+            self.assertIn("build a new writer", str(errors[1]))
+        self.assertFalse(retry_path.exists())
+        self.assertFalse(
+            (Path(self.temp_dir) / f"{DEFAULT_TEMP_DIR_PREFIX}step-2").exists()
+        )
 
     def test_write_with_barrier_commits_into_empty_final_dir(self):
         """Test that an empty final path is replaced rather than nested into."""
