@@ -230,18 +230,35 @@ class CheckpointWriter:
                 "of step with the other ranks; build a new writer to save again."
             )
         try:
-            return self._write(path, checkpoint_info)
+            self._write(path, checkpoint_info)
         except BaseException:
             self._failed = (
                 self._barrier is not None and self._args.rank_info.role_world_size > 1
             )
             raise
 
+        # Outside the guard above: every rank has passed every barrier by now,
+        # so a failing callback leaves the ranks in step and the writer usable.
+        if self._args.finalize_callback is not None:
+            logger.debug(f"Executing finalize callback for {path}")
+            self._args.finalize_callback(
+                CallbackArgs(
+                    path=str(Path(path)),
+                    storage=self._storage,
+                    event_logger=EventLogger(),
+                ),
+            )
+
+        logger.info(
+            f"Successfully wrote checkpoint to {path} for rank {self._args.rank_info.global_rank}"
+        )
+        return None
+
     def _write(
         self,
         path: str,
         checkpoint_info: CheckpointWriteInfo,
-    ) -> Future[None] | None:
+    ) -> None:
         event_logger = EventLogger()
         logger.debug(
             f"Writing checkpoint to {path} for rank {self._args.rank_info.global_rank}"
@@ -424,23 +441,6 @@ class CheckpointWriter:
                     metric_name=f"{self._metric_prefix}.execute.commit_barrier.latency_ms",
                 ),
             )
-
-        # Execute finalize callback if available
-        if self._args.finalize_callback is not None:
-            logger.debug(f"Executing finalize callback for {path}")
-            self._args.finalize_callback(
-                CallbackArgs(
-                    path=str(final_path),
-                    storage=self._storage,
-                    event_logger=event_logger,
-                ),
-            )
-
-        logger.info(
-            f"Successfully wrote checkpoint to {final_path} for rank {self._args.rank_info.global_rank}"
-        )
-
-        return None
 
     def _write_keys(
         self,

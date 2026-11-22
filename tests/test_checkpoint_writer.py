@@ -703,6 +703,76 @@ class TestCheckpointWriter(TestCase):
             ["first.bin", "metadata.bin", METADATA_FILE_NAME, "second.bin"],
         )
 
+    def test_finalize_callback_failure_leaves_the_writers_usable(self):
+        """Every rank has passed every barrier before finalize_callback runs.
+
+        Its failure on one rank leaves the barriers in step, so the next write
+        must go through instead of being refused on that rank while the others
+        wait for it at the staging barrier.
+        """
+        store = dist.TCPStore(
+            "localhost",
+            0,
+            world_size=1,
+            is_master=True,
+            timeout=timedelta(seconds=10),
+            wait_for_workers=False,
+        )
+        barrier_config = DefaultStoreBarrierConfig()
+        barrier_config._store_connection = _TCPStoreConnectionInfo(
+            host="localhost", port=store.port
+        )
+        failures = iter([ConnectionError("registry update timed out")])
+
+        def finalize_callback(_args: CallbackArgs) -> None:
+            failure = next(failures, None)
+            if failure is not None:
+                raise failure
+
+        def save_twice(rank: int) -> list[str]:
+            writer = CheckpointWriter(
+                CheckpointWriterArgs(
+                    config=CheckpointWriterConfig(
+                        checkpoint_write_barrier_timeout_sec=5,
+                        barrier_config=barrier_config,
+                    ),
+                    rank_info=RankInfo(
+                        global_rank=rank,
+                        global_world_size=2,
+                        role_rank=rank,
+                        role_world_size=2,
+                    ),
+                    storage_config=LocalFileSystemStorageConfig(use_direct_io=False),
+                    finalize_callback=finalize_callback if rank == 0 else None,
+                )
+            )
+            info = CheckpointWriteInfo(
+                checkpoint_items={
+                    "shard": CheckpointItem(
+                        value=f"shard-{rank}".encode(),
+                        layout=LayoutInfo(f"shard_{rank}.bin", RawSerialization()),
+                    )
+                }
+            )
+            outcomes = []
+            for step in ("step-1", "step-2"):
+                try:
+                    writer.write(str(Path(self.temp_dir) / step), info)
+                    outcomes.append("ok")
+                except Exception as error:
+                    outcomes.append(type(error).__name__)
+            return outcomes
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            rank_0_outcomes, rank_1_outcomes = pool.map(save_twice, range(2))
+
+        self.assertEqual(rank_0_outcomes, ["ConnectionError", "ok"])
+        self.assertEqual(rank_1_outcomes, ["ok", "ok"])
+        self.assertEqual(
+            sorted(p.name for p in (Path(self.temp_dir) / "step-2").iterdir()),
+            ["shard_0.bin", "shard_1.bin"],
+        )
+
     def test_replace_existing_refuses_a_file_at_the_destination(self):
         final_path = Path(self.temp_dir) / "checkpoint_0011000"
         final_path.write_bytes(b"file")
