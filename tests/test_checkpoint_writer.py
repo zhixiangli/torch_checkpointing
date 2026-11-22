@@ -634,23 +634,74 @@ class TestCheckpointWriter(TestCase):
             writer.write(str(final_path), self._raw_checkpoint_info())
         self.assertEqual([p.name for p in final_path.iterdir()], ["old.bin"])
 
-    def test_replace_existing_keeps_the_old_dir_for_a_metadata_only_commit(self):
-        for pre_finalize_callback in (None, lambda _args: None):
-            with self.subTest(staged=pre_finalize_callback is not None):
-                final_path = self._populated_final(
-                    f"checkpoint_0010500_{pre_finalize_callback is not None}"
-                )
-                writer = self._writer(
-                    _ConcurrencyProbe(1),
-                    barrier_config=_NoopBarrierConfig(),
-                    replace_existing=True,
-                    pre_finalize_callback=pre_finalize_callback,
-                )
-                info = CheckpointWriteInfo(checkpoint_items={})
-                info.serialized_distributed_metadata = b"distributed-metadata"
-                with pytest.raises(FileNotFoundError, match="metadata alone"):
-                    writer.write(str(final_path), info)
-                self.assertEqual([p.name for p in final_path.iterdir()], ["old.bin"])
+    def test_replace_existing_keeps_the_old_dir_when_nothing_was_written(self):
+        """No file from any rank, with or without metadata, commits nothing.
+
+        Without metadata (no item has a resharder) the write used to return
+        success, leaving the old checkpoint in place of the one asked for.
+        """
+        for metadata in (b"distributed-metadata", None):
+            for pre_finalize_callback in (None, lambda _args: None):
+                staged = pre_finalize_callback is not None
+                with self.subTest(metadata=metadata, staged=staged):
+                    final_path = self._populated_final(
+                        f"checkpoint_0010500_{metadata is not None}_{staged}"
+                    )
+                    finalize_callback = mock.Mock()
+                    writer = self._writer(
+                        _ConcurrencyProbe(1),
+                        barrier_config=_NoopBarrierConfig(),
+                        replace_existing=True,
+                        pre_finalize_callback=pre_finalize_callback,
+                        finalize_callback=finalize_callback,
+                    )
+                    info = CheckpointWriteInfo(checkpoint_items={})
+                    info.serialized_distributed_metadata = metadata
+                    with pytest.raises(FileNotFoundError, match="nothing to commit"):
+                        writer.write(str(final_path), info)
+                    self.assertEqual(
+                        [p.name for p in final_path.iterdir()], ["old.bin"]
+                    )
+                    finalize_callback.assert_not_called()
+
+    def test_a_fresh_commit_probes_storage_only_for_a_leftover_staging_dir(self):
+        """rename refuses a missing source and an occupied destination itself.
+
+        Each probe is an uncached round trip on an object store, and every
+        save of a writer with replace_existing=True commits this way.
+        """
+        final_path = Path(self.temp_dir) / "checkpoint_0010700"
+        tmp_path = Path(self.temp_dir) / f"{DEFAULT_TEMP_DIR_PREFIX}{final_path.name}"
+        writer = self._writer(
+            _ConcurrencyProbe(1),
+            barrier_config=_NoopBarrierConfig(),
+            replace_existing=True,
+        )
+        probes: list[tuple[str, Path]] = []
+        original_exists = LocalFileSystemStorage.exists
+        original_isdir = LocalFileSystemStorage.isdir
+
+        def exists(storage, path):
+            probes.append(("exists", Path(path)))
+            return original_exists(storage, path)
+
+        def isdir(storage, path):
+            probes.append(("isdir", Path(path)))
+            return original_isdir(storage, path)
+
+        info = self._raw_checkpoint_info()
+        info.serialized_distributed_metadata = b"distributed-metadata"
+        with (
+            mock.patch.object(LocalFileSystemStorage, "exists", exists),
+            mock.patch.object(LocalFileSystemStorage, "isdir", isdir),
+        ):
+            writer.write(str(final_path), info)
+
+        self.assertEqual(probes, [("exists", tmp_path)])
+        self.assertEqual(
+            sorted(p.name for p in final_path.iterdir()),
+            ["first.bin", "metadata.bin", METADATA_FILE_NAME, "second.bin"],
+        )
 
     def test_replace_existing_refuses_a_file_at_the_destination(self):
         final_path = Path(self.temp_dir) / "checkpoint_0011000"
@@ -906,27 +957,32 @@ class TestCheckpointWriter(TestCase):
 
         self.assertFalse((final_path / METADATA_FILE_NAME).exists())
 
-    def test_write_refuses_a_metadata_only_checkpoint(self):
+    def test_write_refuses_a_checkpoint_no_rank_wrote_a_file_to(self):
         """A checkpoint with no files from any rank has nothing to commit.
 
         Creating final_path directly when tmp_dir_path is absent, or renaming
         an empty tmp_dir_path created only to stage metadata for a
-        pre_finalize_callback, would commit a shard-less checkpoint.
+        pre_finalize_callback, would commit a shard-less checkpoint; returning
+        success without metadata would report a checkpoint that is not there.
         """
         memory_root = Path(f"/checkpoint-writer-{os.getpid()}-{id(self)}")
-        for storage_config, root in (
-            (
-                LocalFileSystemStorageConfig(use_direct_io=False),
-                Path(self.temp_dir),
-            ),
-            (
-                FsspecStorageConfig(protocol="memory"),
-                memory_root,
-            ),
-        ):
-            for pre_finalize_callback in (None, lambda _args: None):
+        cases = [
+            (storage_config, root, metadata, pre_finalize_callback)
+            for storage_config, root in (
+                (
+                    LocalFileSystemStorageConfig(use_direct_io=False),
+                    Path(self.temp_dir),
+                ),
+                (FsspecStorageConfig(protocol="memory"), memory_root),
+            )
+            for metadata in (b"distributed-metadata", None)
+            for pre_finalize_callback in (None, lambda _args: None)
+        ]
+        try:
+            for storage_config, root, metadata, pre_finalize_callback in cases:
                 with self.subTest(
                     storage=type(storage_config).__name__,
+                    metadata=metadata,
                     staged=pre_finalize_callback is not None,
                 ):
                     writer = CheckpointWriter(
@@ -941,12 +997,12 @@ class TestCheckpointWriter(TestCase):
                     )
                     storage = writer._storage
                     info = CheckpointWriteInfo(checkpoint_items={})
-                    info.serialized_distributed_metadata = b"distributed-metadata"
+                    info.serialized_distributed_metadata = metadata
 
                     occupied_path = root / "checkpoint_0007000"
                     storage.mkdir(occupied_path)
                     storage.write(occupied_path / METADATA_FILE_NAME, b"existing")
-                    with pytest.raises(FileNotFoundError, match="metadata alone"):
+                    with pytest.raises(FileNotFoundError, match="nothing to commit"):
                         writer.write(str(occupied_path), info)
                     self.assertEqual(
                         storage.read(occupied_path / METADATA_FILE_NAME),
@@ -959,7 +1015,7 @@ class TestCheckpointWriter(TestCase):
                     )
 
                     fresh_path = root / "checkpoint_0008000"
-                    with pytest.raises(FileNotFoundError, match="metadata alone"):
+                    with pytest.raises(FileNotFoundError, match="nothing to commit"):
                         writer.write(str(fresh_path), info)
                     self.assertFalse(storage.exists(fresh_path))
                     self.assertFalse(
@@ -967,7 +1023,10 @@ class TestCheckpointWriter(TestCase):
                             root / f"{DEFAULT_TEMP_DIR_PREFIX}{fresh_path.name}"
                         )
                     )
-        FsspecStorageConfig(protocol="memory").create_storage().rmdir(memory_root)
+        finally:
+            memory_storage = FsspecStorageConfig(protocol="memory").create_storage()
+            if memory_storage.exists(memory_root):
+                memory_storage.rmdir(memory_root)
 
     def test_default_barrier_commits_through_a_temp_dir(self):
         """Test that a writer left at its defaults commits atomically."""
@@ -1401,7 +1460,16 @@ def test_generic_pre_write_receives_active_storage_and_final_path_before_creatio
         )
     )
     writer = CheckpointWriter(args)
-    writer.write(str(path), CheckpointWriteInfo(checkpoint_items={}))
+    writer.write(
+        str(path),
+        CheckpointWriteInfo(
+            checkpoint_items={
+                "shard": CheckpointItem(
+                    value=b"shard", layout=LayoutInfo("shard.bin", RawSerialization())
+                )
+            }
+        ),
+    )
     assert received == [(str(path), writer._storage, False, False)]
 
 

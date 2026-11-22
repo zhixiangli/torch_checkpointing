@@ -134,6 +134,9 @@ exact. Every backend must implement this table:
 | file | existing file | replace it |
 | file | directory | raise `OSError` |
 
+A missing `src_path` raises `FileNotFoundError` and leaves `dst_path` alone. The
+writer relies on these refusals to commit without probing first.
+
 Two rules generate the table: the contents of `src_path` land *directly* at
 `dst_path` and never nested inside it, and an occupied destination raises instead
 of being merged into or deleted. Only file-onto-file is a replace, because the
@@ -371,9 +374,10 @@ finalized objects.
 **Commit is only as atomic as the driver's move.** On the staged-write path the
 sequence is: rank 0 removes any leftover staging directory from an interrupted
 save -> pre-write barrier -> every rank writes its shards -> pre-finalize
-callback -> write barrier -> rank 0 optionally removes an existing destination
-(`replace_existing=True`), renames the staging directory onto the final path, and
-publishes `metadata.pkl` -> post-commit barrier -> finalize callback.
+callback -> write barrier -> rank 0 renames the staging directory onto the final
+path (with `replace_existing=True`, a rename refused by an existing checkpoint
+removes it and renames again), and publishes `metadata.pkl` -> post-commit
+barrier -> finalize callback.
 `rename` checks the destination and then calls the driver's move. Where that
 move is a single directory rename, it is atomic: on GCS, a bucket with
 hierarchical namespace (including zonal buckets) renames the folder in one

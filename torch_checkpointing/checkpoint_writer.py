@@ -12,8 +12,10 @@ determining checkpoint layout, configuring the writer, and defining hooks
 for custom actions during the checkpoint writing process.
 """
 
+import errno
 import json
 import logging
+import os
 import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -392,33 +394,7 @@ class CheckpointWriter:
                 ):
                     self._storage.rmdir(tmp_dir_path)
             logger.info("Moving checkpoint to final directory")
-            if self._storage.exists(tmp_dir_path):
-                if self._args.config.replace_existing and self._storage.exists(
-                    final_path
-                ):
-                    if self._storage.isdir(final_path):
-                        logger.warning(
-                            "Replacing existing checkpoint directory %s.",
-                            final_path,
-                        )
-                        # The completeness marker leaves first, so an
-                        # interrupted recursive delete never leaves metadata.pkl
-                        # next to missing shards. On flat object stores the
-                        # prefix vanishes with its last object, so re-check
-                        # existence before rmdir.
-                        existing_marker = final_path / METADATA_FILE_NAME
-                        if self._storage.exists(existing_marker):
-                            self._storage.delete(existing_marker)
-                        if self._storage.exists(final_path):
-                            self._storage.rmdir(final_path)
-                    else:
-                        self._storage.rmdir(final_path)
-                self._storage.rename(tmp_dir_path, final_path, is_directory=True)
-            elif metadata:
-                raise FileNotFoundError(
-                    f"No rank wrote a file to {tmp_dir_path}: a checkpoint of "
-                    "metadata alone has nothing to commit."
-                )
+            self._commit(tmp_dir_path, final_path)
             if metadata:
                 self._publish_metadata(final_path, metadata)
             logger.info(
@@ -598,6 +574,46 @@ class CheckpointWriter:
         by subclasses that need to perform cleanup.
         """
         logger.debug("Closing checkpoint writer")
+
+    def _commit(self, tmp_dir_path: Path, final_path: Path) -> None:
+        """Rename the staging directory onto ``final_path``.
+
+        ``rename`` refuses a missing source and an occupied destination on its
+        own, so a commit onto a fresh path, the common case, probes nothing
+        first: on an object store every probe is an uncached round trip. Only a
+        refused rename looks further, to report why or, with
+        ``replace_existing``, to remove the checkpoint in the way.
+        """
+        try:
+            self._storage.rename(tmp_dir_path, final_path, is_directory=True)
+            return
+        except FileNotFoundError as error:
+            if self._storage.exists(tmp_dir_path):
+                raise
+            raise FileNotFoundError(
+                f"No rank wrote a file to {tmp_dir_path}: there is nothing to commit."
+            ) from error
+        except OSError as error:
+            if not self._args.config.replace_existing:
+                raise
+            if not self._storage.isdir(final_path):
+                if self._storage.exists(final_path):
+                    raise NotADirectoryError(
+                        errno.ENOTDIR, os.strerror(errno.ENOTDIR), str(final_path)
+                    ) from error
+                raise
+
+        logger.warning("Replacing existing checkpoint directory %s.", final_path)
+        # The completeness marker leaves first, so an interrupted recursive
+        # delete never leaves metadata.pkl next to missing shards. On flat object
+        # stores the prefix vanishes with its last object, so re-check existence
+        # before rmdir.
+        existing_marker = final_path / METADATA_FILE_NAME
+        if self._storage.exists(existing_marker):
+            self._storage.delete(existing_marker)
+        if self._storage.exists(final_path):
+            self._storage.rmdir(final_path)
+        self._storage.rename(tmp_dir_path, final_path, is_directory=True)
 
     def _write_metadata(
         self, dir_path: Path, serialized_distributed_metadata: bytes | None = None
