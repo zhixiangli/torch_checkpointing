@@ -399,7 +399,8 @@ default, so a load without resharding can find a rank's file without reading
 metadata. An explicit `LayoutInfo.file_path` remains exact. A fixed shared path
 is safe only when the caller selects one rank to write it.
 
-Metadata is written by `role_rank == 0` only. When a barrier is configured, the
+Metadata is written by `role_rank == 0` only. When a barrier is configured and
+`write_to_temp_dir=True` (the default), the
 writer stages files under a `tmp_` directory (rank 0 first clears one left by an
 interrupted save, behind a barrier), waits for all ranks at a barrier, and then
 rank 0 renames the directory onto the final path and publishes `metadata.pkl`

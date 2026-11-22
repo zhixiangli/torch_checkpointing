@@ -245,8 +245,11 @@ readers never observe a half-written directory.
 ### Disabling the temporary directory
 
 `write_to_temp_dir` decides whether files are staged in a temporary directory and renamed in step 6. It defaults to
-`True`; set it to `False` and every rank writes directly to the final path. The
-barrier and callbacks still run as above.
+`True`; set it to `False` and every rank writes directly to the final path. Steps
+2, 6 and 7 are then skipped: rank 0 writes `metadata.pkl` straight to the final
+path in step 3, and the write barrier in step 5 is the only one before
+`finalize_callback`. Nothing is renamed, so a reader can see the checkpoint
+before every rank has finished writing.
 
 This is for a backend where renaming a directory is NOT an atomic operation.
 For example, AWS S3 does not support this: a directory rename requires copying
