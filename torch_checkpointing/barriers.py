@@ -88,7 +88,9 @@ class DefaultStoreBarrierConfig(BarrierConfig):
     of each other need distinct prefixes.
 
     ``generation`` makes each barrier independent of the ones built before it. This is
-    to support multiple independent barriers using the same underlying store.
+    to support multiple independent barriers using the same underlying store. Barriers
+    rebuilt from the same config, e.g. by a writer rebuilt after a failed write, are
+    kept apart as well: each one also counts its builds in the store.
     """
 
     key_prefix: str = DEFAULT_STORE_BARRIER_KEY_PREFIX
@@ -296,8 +298,9 @@ class DefaultStoreBarrier(Barrier):
     even on rank 0 -- the server belongs to the process that created it, and this
     barrier neither owns nor outlives it.
 
-    Every key lives under ``config.key_prefix`` and ``config.generation``, so nothing
-    this barrier writes can collide with the keys the process group keeps in the same
+    Every key lives under ``config.key_prefix``, ``config.generation`` and the
+    number of barriers this rank has built from the config, so nothing this
+    barrier writes can collide with the keys the process group keeps in the same
     store, nor with those of a barrier built before it (see ``generation``).
     """
 
@@ -339,13 +342,19 @@ class DefaultStoreBarrier(Barrier):
         underlying_store = connection.create_client_store(
             timeout=timedelta(seconds=config.timeout_barrier_init_sec)
         )
-        prefix = f"{config.key_prefix}/{config.generation}"
-        self._store = dist.PrefixStore(prefix, underlying_store)
+        namespace = f"{config.key_prefix}/{config.generation}"
+        # Sequence numbers restart at zero in every barrier built from this
+        # config, and keys are never deleted, so each build gets a key space of
+        # its own. The count lives in the store because builds happen in
+        # different processes: each rank counts its own, and the ranks of a role
+        # build their barriers together, so the k-th build on every rank agrees.
+        build = underlying_store.add(f"{namespace}/builds/{rank_info.role_rank}", 1)
+        self._store = dist.PrefixStore(f"{namespace}/{build}", underlying_store)
         logger.info(
             f"Connecting to the default process group's store {connection} as a client "
             f"rank={rank_info.role_rank} world_size={rank_info.role_world_size} "
             f"key_prefix={config.key_prefix} generation={config.generation} "
-            f"timeout_barrier_init_sec={config.timeout_barrier_init_sec}"
+            f"build={build} timeout_barrier_init_sec={config.timeout_barrier_init_sec}"
         )
 
     def execute_barrier(self, timeout_secs: int) -> None:

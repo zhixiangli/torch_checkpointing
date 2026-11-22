@@ -550,15 +550,18 @@ def test_default_store_barrier_keys_are_namespaced_and_sequenced(tcpstore_server
         executions=2,
     )
 
+    # One build per rank, so both ranks meet in build 1's key space.
     assert sorted(store.list_keys()) == [
-        f"{BARRIER_KEY_PREFIX}/7/0/last_member",
-        f"{BARRIER_KEY_PREFIX}/7/0/num_members",
-        f"{BARRIER_KEY_PREFIX}/7/1/last_member",
-        f"{BARRIER_KEY_PREFIX}/7/1/num_members",
+        f"{BARRIER_KEY_PREFIX}/7/1/0/last_member",
+        f"{BARRIER_KEY_PREFIX}/7/1/0/num_members",
+        f"{BARRIER_KEY_PREFIX}/7/1/1/last_member",
+        f"{BARRIER_KEY_PREFIX}/7/1/1/num_members",
+        f"{BARRIER_KEY_PREFIX}/7/builds/0",
+        f"{BARRIER_KEY_PREFIX}/7/builds/1",
     ]
     # Nothing outside our namespace, not even the init key a client writes when it
     # is given a world size: those keys count the store owner's own participants.
-    assert store.num_keys() == 4
+    assert store.num_keys() == 6
 
 
 def test_successive_barriers_do_not_reuse_keys(tcpstore_server):
@@ -576,9 +579,29 @@ def test_successive_barriers_do_not_reuse_keys(tcpstore_server):
     run_barrier_group()
     run_barrier_group()
 
-    # Two barriers at sequence 0 and four keys: the second waited for its own ranks
-    # instead of passing on the `last_member` the first one left behind.
-    assert len(store.list_keys()) == 4
+    # Two barriers at sequence 0, each with its own two keys and a build count per
+    # rank: the second waited for its own ranks instead of passing on the
+    # `last_member` the first one left behind.
+    assert len(store.list_keys()) == 8
+
+
+def test_a_barrier_rebuilt_from_its_config_waits_for_its_own_ranks(tcpstore_server):
+    """A rebuilt barrier restarts at sequence 0 under the same generation.
+
+    Writers are rebuilt from the config they were built from, e.g. after a
+    failed write. Meeting on the keys the previous build left behind, the
+    new barrier would pass without waiting for the other ranks.
+    """
+    _, port = tcpstore_server
+    config = _config_for(
+        _TCPStoreConnectionInfo(host="localhost", port=port),
+        key_prefix=BARRIER_KEY_PREFIX,
+    )
+    _execute_barrier_group(config)
+
+    rebuilt = config.create_barrier(_multi_rank_info(rank=0))
+    with pytest.raises(dist.DistStoreError):
+        rebuilt.execute_barrier(timeout_secs=1)
 
 
 def test_generation_separates_worker_restarts(monkeypatch):
@@ -633,8 +656,10 @@ def test_default_store_barrier_over_a_filestore(tmp_path):
     assert sorted(
         key for key in store.list_keys() if key.startswith(BARRIER_KEY_PREFIX)
     ) == [
-        f"{BARRIER_KEY_PREFIX}/7/0/last_member",
-        f"{BARRIER_KEY_PREFIX}/7/0/num_members",
+        f"{BARRIER_KEY_PREFIX}/7/1/0/last_member",
+        f"{BARRIER_KEY_PREFIX}/7/1/0/num_members",
+        f"{BARRIER_KEY_PREFIX}/7/builds/0",
+        f"{BARRIER_KEY_PREFIX}/7/builds/1",
     ]
 
 
@@ -649,6 +674,7 @@ def test_default_store_barrier_opens_a_client_handle_under_its_own_prefix():
         mock.patch("torch.distributed.PrefixStore") as mock_prefix_store,
         mock.patch("torch.distributed.TCPStore") as mock_tcpstore,
     ):
+        mock_tcpstore.return_value.add.return_value = 1
         config.create_barrier(_multi_rank_info())
 
     mock_tcpstore.assert_called_once_with(
@@ -659,8 +685,11 @@ def test_default_store_barrier_opens_a_client_handle_under_its_own_prefix():
         timeout=timedelta(seconds=DEFAULT_BARRIER_INIT_TIMEOUT_SEC),
         wait_for_workers=False,
     )
+    mock_tcpstore.return_value.add.assert_called_once_with(
+        f"{DEFAULT_STORE_BARRIER_KEY_PREFIX}/7/builds/0", 1
+    )
     mock_prefix_store.assert_called_once_with(
-        f"{DEFAULT_STORE_BARRIER_KEY_PREFIX}/7", mock_tcpstore.return_value
+        f"{DEFAULT_STORE_BARRIER_KEY_PREFIX}/7/1", mock_tcpstore.return_value
     )
 
 

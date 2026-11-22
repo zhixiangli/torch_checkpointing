@@ -172,9 +172,12 @@ checkpoint coordination stays independent of ongoing collective communication.
 `DefaultStoreBarrier` needs no endpoint of its own: it opens a *client* handle to
 the store `init_process_group` already stood up, so there is no second port to
 pick, agree on across ranks and keep free. Its keys live under
-`key_prefix/generation`, so they cannot collide with the process group's own keys
-in that store, nor with those of a barrier built earlier (keys are never deleted,
-and a rebuilt barrier's sequence numbers restart at zero).
+`key_prefix/generation/build`, so they cannot collide with the process group's own
+keys in that store, nor with those of a barrier built earlier (keys are never
+deleted, and a rebuilt barrier's sequence numbers restart at zero). `build` counts,
+in the store, the barriers each rank has built from the config, so a writer rebuilt
+from the same config after a failed write meets on fresh keys too; the ranks of a
+role rebuild their writers together, which keeps their counts in step.
 
 Two consequences worth knowing:
 
