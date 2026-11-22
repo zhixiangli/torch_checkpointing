@@ -304,6 +304,8 @@ class CheckpointWriter:
         else:
             tmp_dir_path = final_path
 
+        # Times this rank's own writes, not the wait for the others above.
+        filesystem_event_logger = EventLogger()
         state_dict = checkpoint_info.state_dict
         save_items: list[tuple[str, LayoutInfo, Path]] = []
         for key, layout_info in checkpoint_info.layout_info_mappings.items():
@@ -333,18 +335,20 @@ class CheckpointWriter:
             logger.info(
                 "Writing metadata to checkpoint directory",
             )
+            metadata_event_logger = EventLogger()
             self._write_metadata(tmp_dir_path, metadata)
             logger.info(
                 "Done writing metadata to checkpoint directory",
-                extra=event_logger(
+                extra=metadata_event_logger(
                     EventType.LOG_METRIC,
                     metric_name=f"{self._metric_prefix}.execute.filesystem.metadata.write.latency_ms",
+                    end_to_end=True,
                 ),
             )
 
         logger.info(
             "Finished all filesystem writes",
-            extra=event_logger(
+            extra=filesystem_event_logger(
                 EventType.LOG_METRIC,
                 metric_name=f"{self._metric_prefix}.execute.filesystem.save.latency_ms",
                 end_to_end=True,
@@ -414,13 +418,6 @@ class CheckpointWriter:
             self._commit(tmp_dir_path, final_path)
             if metadata:
                 self._publish_metadata(final_path, metadata)
-            logger.info(
-                "Finished moving checkpoint to final directory",
-                extra=event_logger(
-                    EventType.LOG_METRIC,
-                    metric_name=f"{self._metric_prefix}.execute.rename.latency_ms",
-                ),
-            )
 
         # Every rank waits for rank 0's commit, so none runs the finalize
         # callback or returns before the checkpoint exists at final_path. If
@@ -584,9 +581,9 @@ class CheckpointWriter:
         refused rename looks further, to report why or, with
         ``replace_existing``, to remove the checkpoint in the way.
         """
+        rename_event_logger = EventLogger()
         try:
             self._storage.rename(tmp_dir_path, final_path, is_directory=True)
-            return
         except FileNotFoundError as error:
             if self._storage.exists(tmp_dir_path):
                 raise
@@ -602,8 +599,12 @@ class CheckpointWriter:
                         errno.ENOTDIR, os.strerror(errno.ENOTDIR), str(final_path)
                     ) from error
                 raise
+        else:
+            self._log_rename_latency(rename_event_logger)
+            return
 
         logger.warning("Replacing existing checkpoint directory %s.", final_path)
+        replace_event_logger = EventLogger()
         # The completeness marker leaves first, so an interrupted recursive
         # delete never leaves metadata.pkl next to missing shards. On flat object
         # stores the prefix vanishes with its last object, so re-check existence
@@ -613,7 +614,27 @@ class CheckpointWriter:
             self._storage.delete(existing_marker)
         if self._storage.exists(final_path):
             self._storage.rmdir(final_path)
+        logger.info(
+            "Removed the checkpoint being replaced",
+            extra=replace_event_logger(
+                EventType.LOG_METRIC,
+                metric_name=f"{self._metric_prefix}.execute.replace_existing.latency_ms",
+                end_to_end=True,
+            ),
+        )
+        rename_event_logger = EventLogger()
         self._storage.rename(tmp_dir_path, final_path, is_directory=True)
+        self._log_rename_latency(rename_event_logger)
+
+    def _log_rename_latency(self, event_logger: EventLogger) -> None:
+        logger.info(
+            "Finished moving checkpoint to final directory",
+            extra=event_logger(
+                EventType.LOG_METRIC,
+                metric_name=f"{self._metric_prefix}.execute.rename.latency_ms",
+                end_to_end=True,
+            ),
+        )
 
     def _write_metadata(
         self, dir_path: Path, serialized_distributed_metadata: bytes | None = None
@@ -639,6 +660,15 @@ class CheckpointWriter:
         a zonal bucket. It is staged under another name and renamed onto the
         marker, a file replace that every backend commits in one step.
         """
+        metadata_event_logger = EventLogger()
         staged_path = dir_path / f".{METADATA_FILE_NAME}.tmp"
         self._storage.write(staged_path, serialized_metadata)
         self._storage.rename(staged_path, dir_path / METADATA_FILE_NAME)
+        logger.info(
+            "Published metadata to checkpoint directory",
+            extra=metadata_event_logger(
+                EventType.LOG_METRIC,
+                metric_name=f"{self._metric_prefix}.execute.filesystem.metadata.write.latency_ms",
+                end_to_end=True,
+            ),
+        )
