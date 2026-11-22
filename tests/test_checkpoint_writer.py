@@ -665,6 +665,41 @@ class TestCheckpointWriter(TestCase):
                     )
                     finalize_callback.assert_not_called()
 
+    def test_replace_existing_does_not_replace_after_a_move_cut_short(self):
+        """Only a refused, occupied destination is replaced.
+
+        A directory move on a flat object store can fail partway, e.g. on a
+        timeout, with some files already at final_path. Deleting final_path
+        then would throw those files away and publish metadata.pkl over the
+        rest.
+        """
+        final_path = Path(self.temp_dir) / "checkpoint_0010700"
+        writer = self._writer(
+            _ConcurrencyProbe(1),
+            barrier_config=_NoopBarrierConfig(),
+            replace_existing=True,
+        )
+        rename = writer._storage.rename
+        timed_out = []
+
+        def move_one_file_then_time_out_once(
+            src_path, dst_path, is_directory=False, background_cleanup=False
+        ):
+            if not is_directory or timed_out:
+                return rename(src_path, dst_path, is_directory, background_cleanup)
+            timed_out.append(True)
+            dst_path.mkdir()
+            first = sorted(os.listdir(src_path))[0]
+            os.replace(src_path / first, dst_path / first)
+            raise TimeoutError("timed out mid-move")
+
+        writer._storage.rename = move_one_file_then_time_out_once
+        info = self._raw_checkpoint_info()
+        info.serialized_distributed_metadata = b"distributed-metadata"
+        with pytest.raises(TimeoutError, match="mid-move"):
+            writer.write(str(final_path), info)
+        self.assertEqual([p.name for p in final_path.iterdir()], ["first.bin"])
+
     def test_a_fresh_commit_probes_storage_only_for_a_leftover_staging_dir(self):
         """rename refuses a missing source and an occupied destination itself.
 

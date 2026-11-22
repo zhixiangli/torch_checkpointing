@@ -41,6 +41,9 @@ from .types import RankInfo
 
 DEFAULT_TEMP_DIR_PREFIX = "tmp_"
 
+# The errnos with which Storage.rename refuses an occupied destination.
+_OCCUPIED_DESTINATION_ERRNOS = frozenset({errno.EEXIST, errno.ENOTEMPTY, errno.ENOTDIR})
+
 logger = logging.getLogger(__name__)
 
 
@@ -591,7 +594,14 @@ class CheckpointWriter:
                 f"No rank wrote a file to {tmp_dir_path}: there is nothing to commit."
             ) from error
         except OSError as error:
-            if not self._args.config.replace_existing:
+            # Only a refusal of the occupied destination is replaced. Any other
+            # error, such as a timeout midway through a move on a flat object
+            # store, may have left part of this checkpoint at final_path, and a
+            # delete would throw it away.
+            if not self._args.config.replace_existing or not (
+                isinstance(error, FileExistsError)
+                or error.errno in _OCCUPIED_DESTINATION_ERRNOS
+            ):
                 raise
             if not self._storage.isdir(final_path):
                 if self._storage.exists(final_path):

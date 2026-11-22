@@ -200,7 +200,11 @@ class Storage(ABC):
 
         A missing ``src_path`` raises ``FileNotFoundError`` and leaves
         ``dst_path`` alone; the checkpoint writer relies on this and on the
-        refusals above to commit without probing either path first.
+        refusals above to commit without probing either path first. Refuse an
+        occupied destination with ``FileExistsError``, or an ``OSError`` whose
+        errno is ``EEXIST``, ``ENOTEMPTY`` or ``ENOTDIR``: with
+        ``replace_existing`` the writer deletes the destination only after such
+        a refusal, since any other error may come from a move cut short.
 
         Two rules generate that table, and both exist because getting them
         wrong is silent data corruption rather than a visible failure.

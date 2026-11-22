@@ -135,14 +135,18 @@ exact. Every backend must implement this table:
 | file | directory | raise `OSError` |
 
 A missing `src_path` raises `FileNotFoundError` and leaves `dst_path` alone. The
-writer relies on these refusals to commit without probing first.
+writer relies on these refusals to commit without probing first. Refuse an
+occupied destination with `FileExistsError`, or an `OSError` whose errno is
+`EEXIST`, `ENOTEMPTY` or `ENOTDIR`: with `replace_existing=True` the writer
+deletes the destination only after such a refusal, because any other error may
+come from a move cut short, with part of the checkpoint already at `dst_path`.
 
 Two rules generate the table: the contents of `src_path` land *directly* at
 `dst_path` and never nested inside it, and an occupied destination raises instead
 of being merged into or deleted. Only file-onto-file is a replace, because the
 atomic-write callers ask for that by construction; callers that mean to replace
 an existing checkpoint directory use `CheckpointWriterConfig(replace_existing=True)`,
-which deletes explicitly before calling `rename`. A nested or merged commit is
+which deletes it explicitly once `rename` refuses it, then renames again. A nested or merged commit is
 silent data corruption rather than a cosmetic difference, which is why this is
 spelled out rather than left to each backend's judgement.
 
