@@ -257,9 +257,10 @@ class TestStorage(TestCase):
         src = self._populated_dir("src")
         dst = self._populated_dir("dst", file_name="existing.bin")
 
-        with pytest.raises(OSError):
+        with pytest.raises(OccupiedDestinationError) as raised:
             self.storage.rename(src, dst, is_directory=True)
 
+        self.assertEqual(raised.value.errno, errno.ENOTEMPTY)
         # Neither side is touched: no nesting under dst, no merge, no deletion.
         self.assertEqual(os.listdir(src), ["payload.bin"])
         self.assertEqual(os.listdir(dst), ["existing.bin"])
@@ -270,10 +271,24 @@ class TestStorage(TestCase):
         dst = Path(self.temp_dir) / "dst"
         dst.write_bytes(b"not a directory")
 
-        with pytest.raises(OSError):
+        with pytest.raises(OccupiedDestinationError) as raised:
             self.storage.rename(src, dst, is_directory=True)
 
+        self.assertEqual(raised.value.errno, errno.ENOTDIR)
         self.assertEqual(dst.read_bytes(), b"not a directory")
+
+    def test_rename_directory_rejects_symlink_destination(self):
+        """A symlink to a directory is refused as not a directory."""
+        src = self._populated_dir("src")
+        target = self._populated_dir("real", file_name="existing.bin")
+        link = Path(self.temp_dir) / "link"
+        link.symlink_to(target)
+
+        with pytest.raises(OccupiedDestinationError) as raised:
+            self.storage.rename(src, link, is_directory=True)
+
+        self.assertEqual(raised.value.errno, errno.ENOTDIR)
+        self.assertEqual(os.listdir(target), ["existing.bin"])
 
     def test_rename_directory_across_filesystems_rejects_populated_destination(
         self,
@@ -283,9 +298,10 @@ class TestStorage(TestCase):
         dst = self._populated_dir("dst", file_name="existing.bin")
 
         with _renames_across_filesystems():
-            with pytest.raises(OSError):
+            with pytest.raises(OccupiedDestinationError) as raised:
                 self.storage.rename(src, dst, is_directory=True)
 
+        self.assertEqual(raised.value.errno, errno.ENOTEMPTY)
         self.assertEqual(os.listdir(src), ["payload.bin"])
         self.assertEqual(os.listdir(dst), ["existing.bin"])
 
@@ -310,9 +326,10 @@ class TestStorage(TestCase):
         dst = Path(self.temp_dir) / "dst"
         os.makedirs(dst)
 
-        with pytest.raises(OSError):
+        with pytest.raises(OccupiedDestinationError) as raised:
             self.storage.rename(src, dst)
 
+        self.assertEqual(raised.value.errno, errno.EISDIR)
         self.assertEqual(os.listdir(dst), [])
         self.assertEqual(src.read_bytes(), b"new")
 
@@ -539,33 +556,3 @@ def test_direct_io_refusal_covers_reads_and_writes(
 
     # The refusal in one direction stops O_DIRECT attempts in the other.
     assert direct_opens == [str(path)]
-
-
-def _populated(path: Path, name: str) -> Path:
-    path.mkdir()
-    (path / name).write_bytes(b"data")
-    return path
-
-
-def test_refused_directory_rename_raises_occupied_destination_error(tmp_path):
-    storage = LocalFileSystemStorageConfig(use_direct_io=False).create_storage()
-    src = _populated(tmp_path / "src", "a.bin")
-    dst = _populated(tmp_path / "dst", "b.bin")
-
-    with pytest.raises(OccupiedDestinationError) as raised:
-        storage.rename(src, dst, is_directory=True)
-
-    assert raised.value.errno == errno.ENOTEMPTY
-
-
-def test_symlink_destination_is_refused_as_not_a_directory(tmp_path):
-    storage = LocalFileSystemStorageConfig(use_direct_io=False).create_storage()
-    src = _populated(tmp_path / "src", "a.bin")
-    target = _populated(tmp_path / "real", "b.bin")
-    (tmp_path / "link").symlink_to(target)
-
-    with pytest.raises(OccupiedDestinationError) as raised:
-        storage.rename(src, tmp_path / "link", is_directory=True)
-
-    assert raised.value.errno == errno.ENOTDIR
-    assert sorted(p.name for p in target.iterdir()) == ["b.bin"]

@@ -45,7 +45,10 @@ def _raise_worker_error(error_type, *args):
         raise LocalError(message)
     if error_type is TwoArgumentError:
         raise TwoArgumentError(message, "detail")
-    error = error_type(message)
+    if error_type is OccupiedDestinationError:
+        error = OccupiedDestinationError(errno.ENOTEMPTY, message)
+    else:
+        error = error_type(message)
     # Transport must not serialize the exception instance itself.
     error.unpicklable = lambda: None
     raise error
@@ -59,6 +62,12 @@ def _initialize():
     "error_type, expected_type, during_init",
     [
         pytest.param(FileExistsError, FileExistsError, False, id="builtin"),
+        pytest.param(
+            OccupiedDestinationError,
+            OccupiedDestinationError,
+            False,
+            id="occupied-destination",
+        ),
         pytest.param(CallbackError, CallbackError, False, id="custom"),
         pytest.param(EOFError, EOFError, False, id="application-pipe-error"),
         pytest.param(TwoArgumentError, RuntimeError, False, id="constructor-fallback"),
@@ -116,33 +125,3 @@ def test_unavailable_exception_type_retains_worker_error():
     ):
         with pytest.raises(RuntimeError, match="original worker traceback"):
             process._recv()
-
-
-def _raise_occupied_destination(args):
-    raise OccupiedDestinationError(errno.ENOTEMPTY, "worker rejected checkpoint")
-
-
-def test_occupied_destination_error_crosses_the_subprocess(tmp_path):
-    rank_info = RankInfo(
-        global_rank=0, global_world_size=1, role_rank=0, role_world_size=1
-    )
-    process = CheckpointProcess(
-        rank_info=rank_info,
-        config=CheckpointProcessConfig(),
-        subprocess_init_fn=_initialize,
-        subprocess_init_args=(),
-        checkpoint_writer_args=CheckpointWriterArgs(
-            config=CheckpointWriterConfig(),
-            rank_info=rank_info,
-            storage_config=LocalFileSystemStorageConfig(use_direct_io=False),
-            pre_write_callback=_raise_occupied_destination,
-        ),
-    )
-    try:
-        with pytest.raises(FileExistsError, match="rejected checkpoint") as caught:
-            process.write(
-                CheckpointWriteInfo(checkpoint_items={}), str(tmp_path / "checkpoint")
-            ).result(timeout=30)
-        assert type(caught.value) is OccupiedDestinationError
-    finally:
-        process.close()

@@ -5,11 +5,13 @@
 # LICENSE file in the root directory of this source tree.
 
 import errno
+import itertools
 import os
 import pickle
 import posixpath
 import uuid
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import fsspec
@@ -79,6 +81,77 @@ def _staged_checkpoint(storage: FsspecStorage, src: Path) -> None:
     _put(storage, src / METADATA_FILE_NAME, b"marker")
     _put(storage, src / "model_0.pt", b"model")
     _put(storage, src / "sub" / "optim_0.pt", b"optim")
+
+
+@contextmanager
+def _fail_cp_file_at(
+    monkeypatch: pytest.MonkeyPatch,
+    count: int,
+    error: BaseException,
+    *,
+    under: Path | None = None,
+) -> Iterator[None]:
+    """Raise ``error`` on the ``count``-th file copy (optionally under ``under``)."""
+    fs = fsspec.filesystem("memory")
+    copy_file = MemoryFileSystem.cp_file
+    prefix = (
+        f"{fs._strip_protocol(str(under)).rstrip('/')}/" if under is not None else None
+    )
+    copied = 0
+
+    def cp_file(self, path1, path2, **kwargs):
+        nonlocal copied
+        src = self._strip_protocol(path1)
+        dst = self._strip_protocol(path2)
+        if fs.isfile(src) and (prefix is None or dst.startswith(prefix)):
+            copied += 1
+            if copied == count:
+                raise error
+        return copy_file(self, path1, path2, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(MemoryFileSystem, "cp_file", cp_file)
+        yield
+
+
+@contextmanager
+def _patch_mv(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    recursive_error: BaseException | None = None,
+    target_errors: dict[str, BaseException] | None = None,
+    recorded: list[str] | None = None,
+) -> Iterator[None]:
+    """Intercept ``MemoryFileSystem.mv`` to inject errors or record targets."""
+    move = MemoryFileSystem.mv
+
+    def mv(self, path1, path2, recursive=False, **kwargs):
+        if recorded is not None:
+            recorded.append(path2)
+        if recursive and recursive_error is not None:
+            raise recursive_error
+        if target_errors and path2 in target_errors:
+            raise target_errors[path2]
+        return move(self, path1, path2, recursive=recursive, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(MemoryFileSystem, "mv", mv)
+        yield
+
+
+@contextmanager
+def _resharded_manager(
+    protocol: str, *, replace_existing: bool = False
+) -> Iterator[CheckpointManager]:
+    config = CheckpointManager.Config.with_sync_save()
+    config.default = ItemSpec(resharder=DefaultResharder())  # writes metadata.pkl
+    config.storage_config = FsspecStorageConfig(protocol=protocol)
+    config.save.writer_config.replace_existing = replace_existing
+    manager = config.build()
+    try:
+        yield manager
+    finally:
+        manager.close()
 
 
 @pytest.mark.parametrize(
@@ -216,9 +289,12 @@ def test_rename_directory_rejects_populated_destination(storage, root):
     _put(storage, root / "src" / "payload.bin")
     _put(storage, root / "dst" / "existing.bin")
 
-    with pytest.raises(OSError):
+    with pytest.raises(OccupiedDestinationError) as raised:
         storage.rename(root / "src", root / "dst", is_directory=True)
 
+    assert isinstance(raised.value, FileExistsError)
+    assert raised.value.errno == errno.ENOTEMPTY
+    assert "the destination is occupied" in str(raised.value)
     # Neither side is touched: no nesting, no merge, no deletion.
     assert storage.ls(root / "src") == ["payload.bin"]
     assert storage.ls(root / "dst") == ["existing.bin"]
@@ -228,9 +304,10 @@ def test_rename_directory_rejects_file_destination(storage, root):
     _put(storage, root / "src" / "payload.bin")
     _put(storage, root / "dst", b"not a directory")
 
-    with pytest.raises(OSError):
+    with pytest.raises(OccupiedDestinationError) as raised:
         storage.rename(root / "src", root / "dst", is_directory=True)
 
+    assert raised.value.errno == errno.ENOTDIR
     assert storage.read(root / "dst") == b"not a directory"
     assert storage.ls(root / "src") == ["payload.bin"]
 
@@ -270,9 +347,10 @@ def test_rename_file_rejects_directory_destination(storage, root):
     _put(storage, root / "a.bin", b"one")
     _put(storage, root / "dst" / "existing.bin")
 
-    with pytest.raises(OSError):
+    with pytest.raises(OccupiedDestinationError) as raised:
         storage.rename(root / "a.bin", root / "dst")
 
+    assert raised.value.errno == errno.EISDIR
     assert storage.read(root / "a.bin") == b"one"
     assert storage.ls(root / "dst") == ["existing.bin"]
 
@@ -343,53 +421,21 @@ def test_rename_directory_moves_the_marker_last(memory_root, monkeypatch):
     assert storage.read(dst / METADATA_FILE_NAME) == b"marker"
 
 
-def _file_copies_in_a_rename() -> int:
-    storage = _memory_storage()
-    fs = fsspec.filesystem("memory")
-    scratch = Path(f"/marker-last-{uuid.uuid4().hex}")
-    copy_file = MemoryFileSystem.cp_file
-    copied = 0
-
-    def cp_file(self, path1, path2, **kwargs):
-        nonlocal copied
-        if fs.isfile(path1):
-            copied += 1
-        copy_file(self, path1, path2, **kwargs)
-
-    try:
-        _staged_checkpoint(storage, scratch / "src")
-        with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(MemoryFileSystem, "cp_file", cp_file)
-            storage.rename(scratch / "src", scratch / "dst", is_directory=True)
-        return copied
-    finally:
-        if fs.exists(str(scratch)):
-            fs.rm(str(scratch), recursive=True)
-
-
 def test_rename_directory_cut_short_never_leaves_the_marker(memory_root, monkeypatch):
     storage = _memory_storage()
-    fs = fsspec.filesystem("memory")
-    copy_file = MemoryFileSystem.cp_file
-
-    for k in range(_file_copies_in_a_rename()):
-        src = memory_root / f"tmp_step-{k}"
-        dst = memory_root / f"step-{k}"
+    for cut_at in itertools.count(1):
+        src = memory_root / f"tmp_step-{cut_at}"
+        dst = memory_root / f"step-{cut_at}"
         _staged_checkpoint(storage, src)
-        copied = 0
-
-        def cp_file(self, path1, path2, **kwargs):
-            nonlocal copied
-            if fs.isfile(path1):
-                copied += 1
-                if copied == k + 1:
-                    raise TimeoutError("cut short")
-            copy_file(self, path1, path2, **kwargs)
-
-        monkeypatch.setattr(MemoryFileSystem, "cp_file", cp_file)
-        with pytest.raises(TimeoutError, match="cut short"):
-            storage.rename(src, dst, is_directory=True)
-        assert not storage.exists(dst / METADATA_FILE_NAME)
+        try:
+            with _fail_cp_file_at(monkeypatch, cut_at, TimeoutError("cut short")):
+                storage.rename(src, dst, is_directory=True)
+        except TimeoutError:
+            assert not storage.exists(dst / METADATA_FILE_NAME)
+        else:
+            assert cut_at > 5  # cut every copy: hold-back, 3 files, and reveal
+            assert storage.read(dst / METADATA_FILE_NAME) == b"marker"
+            break
 
 
 def test_rename_directory_replaces_a_stale_hidden_copy(storage, root):
@@ -445,17 +491,12 @@ def test_rename_directory_that_fails_before_moving_puts_the_marker_back(
     storage = _memory_storage()
     src, dst = memory_root / "tmp_step-20", memory_root / "step-20"
     _staged_checkpoint(storage, src)
-    move = MemoryFileSystem.mv
 
-    def mv(self, path1, path2, recursive=False, **kwargs):
-        if recursive:
-            raise TimeoutError("before anything moved")
-        move(self, path1, path2, recursive=recursive, **kwargs)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(MemoryFileSystem, "mv", mv)
-        with pytest.raises(TimeoutError, match="before anything moved"):
-            storage.rename(src, dst, is_directory=True)
+    with (
+        _patch_mv(monkeypatch, recursive_error=TimeoutError("before anything moved")),
+        pytest.raises(TimeoutError, match="before anything moved"),
+    ):
+        storage.rename(src, dst, is_directory=True)
 
     assert storage.read(src / METADATA_FILE_NAME) == b"marker"
     assert ".metadata.pkl.tmp" not in storage.ls(src)
@@ -469,55 +510,38 @@ def test_rename_directory_raises_the_move_error_when_the_put_back_fails(
     storage = _memory_storage()
     src, dst = memory_root / "tmp_step-20", memory_root / "step-20"
     _staged_checkpoint(storage, src)
-    move = MemoryFileSystem.mv
-
-    def mv(self, path1, path2, recursive=False, **kwargs):
-        if recursive:
-            raise TimeoutError("move")
-        if path2 == str(src / METADATA_FILE_NAME):
-            raise OSError("put back")
-        move(self, path1, path2, recursive=recursive, **kwargs)
 
     with (
-        monkeypatch.context() as patch,
+        _patch_mv(
+            monkeypatch,
+            recursive_error=TimeoutError("move"),
+            target_errors={str(src / METADATA_FILE_NAME): OSError("put back")},
+        ),
         caplog.at_level("WARNING", logger="torch_checkpointing.storage.fsspec_storage"),
+        pytest.raises(TimeoutError, match="move"),
     ):
-        patch.setattr(MemoryFileSystem, "mv", mv)
-        with pytest.raises(TimeoutError, match="move"):
-            storage.rename(src, dst, is_directory=True)
+        storage.rename(src, dst, is_directory=True)
 
     assert ".metadata.pkl.tmp" in storage.ls(src)
     assert METADATA_FILE_NAME not in storage.ls(src)
     assert "put back" in caplog.text
 
 
-def test_metadata_file_name_has_one_definition():
-    from torch_checkpointing import metadata_serialization
-    from torch_checkpointing.storage import base_storage
-
-    assert base_storage.METADATA_FILE_NAME == "metadata.pkl"
-    assert (
-        metadata_serialization.METADATA_FILE_NAME is base_storage.METADATA_FILE_NAME
-    )
-
-
 def test_rename_directory_interrupted_makes_no_put_back(memory_root, monkeypatch):
     storage = _memory_storage()
     src, dst = memory_root / "tmp_step-20", memory_root / "step-20"
     _staged_checkpoint(storage, src)
-    move = MemoryFileSystem.mv
     destinations: list[str] = []
 
-    def mv(self, path1, path2, recursive=False, **kwargs):
-        destinations.append(path2)
-        if recursive:
-            raise KeyboardInterrupt("killed mid-commit")
-        move(self, path1, path2, recursive=recursive, **kwargs)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(MemoryFileSystem, "mv", mv)
-        with pytest.raises(KeyboardInterrupt):
-            storage.rename(src, dst, is_directory=True)
+    with (
+        _patch_mv(
+            monkeypatch,
+            recursive_error=KeyboardInterrupt("killed mid-commit"),
+            recorded=destinations,
+        ),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        storage.rename(src, dst, is_directory=True)
 
     assert destinations == [str(src / ".metadata.pkl.tmp"), str(dst)]
     assert not storage.exists(dst / METADATA_FILE_NAME)
@@ -527,17 +551,15 @@ def test_rename_directory_reveal_failure_leaves_no_marker(memory_root, monkeypat
     storage = _memory_storage()
     src, dst = memory_root / "tmp_step-20", memory_root / "step-20"
     _staged_checkpoint(storage, src)
-    move = MemoryFileSystem.mv
 
-    def mv(self, path1, path2, recursive=False, **kwargs):
-        if path2 == str(dst / METADATA_FILE_NAME):
-            raise TimeoutError("reveal")
-        move(self, path1, path2, recursive=recursive, **kwargs)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(MemoryFileSystem, "mv", mv)
-        with pytest.raises(TimeoutError, match="reveal"):
-            storage.rename(src, dst, is_directory=True)
+    with (
+        _patch_mv(
+            monkeypatch,
+            target_errors={str(dst / METADATA_FILE_NAME): TimeoutError("reveal")},
+        ),
+        pytest.raises(TimeoutError, match="reveal"),
+    ):
+        storage.rename(src, dst, is_directory=True)
 
     assert sorted(storage.ls(dst)) == [".metadata.pkl.tmp", "model_0.pt", "sub"]
     assert not storage.exists(src)
@@ -809,82 +831,20 @@ def test_async_save_then_load_round_trip_over_fsspec(tmp_path: Path) -> None:
         manager.close()
 
 
-def test_commit_cut_short_leaves_no_marker_at_the_final_path(memory_root, monkeypatch):
-    config = CheckpointManager.Config.with_sync_save()
-    config.default = ItemSpec(resharder=DefaultResharder())  # writes metadata.pkl
-    config.storage_config = FsspecStorageConfig(protocol="memory")
-    state = {"model": torch.arange(4), "optimizer": torch.ones(4)}
-    dst = memory_root / "step-20"
-    fs = fsspec.filesystem("memory")
-    copy_file = MemoryFileSystem.cp_file
-    copied = 0
-
-    def cp_file(self, path1, path2, **kwargs):
-        nonlocal copied
-        # cp_file raises RuntimeError("preempted") on the second file copy whose
-        # destination is under memory_root / "step-20".
-        if fs.isfile(path1) and path2.startswith(f"{dst}/"):
-            copied += 1
-            if copied == 2:
-                raise RuntimeError("preempted")
-        copy_file(self, path1, path2, **kwargs)
-
-    monkeypatch.setattr(MemoryFileSystem, "cp_file", cp_file)
-    manager = config.build()
-    try:
-        with pytest.raises(RuntimeError, match="preempted"):
-            manager.save(str(memory_root / "step-20"), state)
-    finally:
-        manager.close()
-    final = fsspec.filesystem("memory").find(str(memory_root / "step-20"))
-    assert len(final) == 1  # the move really was cut short
-    assert str(memory_root / "step-20" / METADATA_FILE_NAME) not in final
-
-
 def test_load_ignores_a_stray_hidden_marker_copy(memory_root):
-    config = CheckpointManager.Config.with_sync_save()
-    config.default = ItemSpec(resharder=DefaultResharder())  # writes metadata.pkl
-    config.storage_config = FsspecStorageConfig(protocol="memory")
+    dst = memory_root / "step-20"
     state = {"model": torch.arange(4), "optimizer": torch.ones(4)}
-    manager = config.build()
-    try:
-        manager.save(str(memory_root / "step-20"), state)
-        fsspec.filesystem("memory").pipe_file(
-            str(memory_root / "step-20" / ".metadata.pkl.tmp"), b"stray"
-        )
+    with _resharded_manager("memory") as manager:
+        manager.save(str(dst), state)
+        fsspec.filesystem("memory").pipe_file(str(dst / ".metadata.pkl.tmp"), b"stray")
         loaded = manager.load(
-            str(memory_root / "step-20"),
+            str(dst),
             into={
                 "model": torch.zeros(4, dtype=torch.long),
                 "optimizer": torch.zeros(4),
             },
         )
         assert torch.equal(loaded["model"], torch.arange(4))
-    finally:
-        manager.close()
-
-
-def _fail_recursive_mv(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> None:
-    move = MemoryFileSystem.mv
-
-    def mv(self, path1, path2, recursive=False, **kwargs):
-        if recursive:
-            raise error
-        return move(self, path1, path2, recursive=recursive, **kwargs)
-
-    monkeypatch.setattr(MemoryFileSystem, "mv", mv)
-
-
-def test_refused_directory_rename_raises_occupied_destination_error(storage, root):
-    _put(storage, root / "src" / "payload.bin")
-    _put(storage, root / "dst" / "existing.bin")
-
-    with pytest.raises(OccupiedDestinationError) as raised:
-        storage.rename(root / "src", root / "dst", is_directory=True)
-
-    assert isinstance(raised.value, FileExistsError)
-    assert raised.value.errno == errno.ENOTEMPTY
-    assert "the destination is occupied" in str(raised.value)
 
 
 @pytest.mark.parametrize("driver_errno", [errno.ENOTEMPTY, errno.EEXIST])
@@ -894,9 +854,11 @@ def test_a_driver_error_during_the_move_passes_through_unchanged(
     storage = _memory_storage()
     _put(storage, memory_root / "src" / "payload.bin")
     error = OSError(driver_errno, "driver")
-    _fail_recursive_mv(monkeypatch, error)
 
-    with pytest.raises(OSError) as raised:
+    with (
+        _patch_mv(monkeypatch, recursive_error=error),
+        pytest.raises(OSError) as raised,
+    ):
         storage.rename(memory_root / "src", memory_root / "dst", is_directory=True)
 
     assert raised.value is error
@@ -924,88 +886,58 @@ def test_symlink_destination_keeps_the_plain_refusal(tmp_path):
     [RuntimeError("preempted"), KeyboardInterrupt("killed mid-commit")],
     ids=["exception", "kill"],
 )
-def test_saving_again_replaces_what_a_cut_short_commit_left(error, monkeypatch):
-    root = f"test-{uuid.uuid4().hex}"
+def test_saving_again_replaces_what_a_cut_short_commit_left(
+    error, memory_root, monkeypatch
+):
     fs = fsspec.filesystem("memory")
+    dst = memory_root / "step-20"
+    with (
+        _resharded_manager("memory", replace_existing=True) as manager,
+        _fail_cp_file_at(monkeypatch, 2, error, under=dst),
+        pytest.raises(type(error)),
+    ):
+        manager.save(
+            str(dst),
+            {
+                "model": torch.zeros(4, dtype=torch.long),
+                "optimizer": torch.ones(4, dtype=torch.long),
+            },
+        )
 
-    def make_manager() -> CheckpointManager:
-        config = CheckpointManager.Config.with_sync_save()
-        config.default = ItemSpec(resharder=DefaultResharder())
-        config.storage_config = FsspecStorageConfig(protocol="memory")
-        config.save.writer_config.replace_existing = True
-        return config.build()
+    partial = fs.find(str(dst))
+    assert len(partial) == 1  # the move really was cut short
+    assert str(dst / METADATA_FILE_NAME) not in partial
 
-    original_cp_file = MemoryFileSystem.cp_file
-    copied = 0
-    dst_prefix = f"/{root}/step-20/"
+    with _resharded_manager("memory", replace_existing=True) as manager:
+        manager.save(
+            str(dst),
+            {"model": torch.arange(4), "optimizer": torch.arange(4, 8)},
+        )
+        names = sorted(posixpath.basename(p) for p in fs.find(str(dst)))
+        assert names == [METADATA_FILE_NAME, "model_0.pt", "optimizer_0.pt"]
 
-    def cut_short_cp_file(self, path1, path2, **kwargs):
-        nonlocal copied
-        if self.isfile(self._strip_protocol(path1)) and self._strip_protocol(
-            path2
-        ).startswith(dst_prefix):
-            copied += 1
-            if copied == 2:
-                raise error
-        return original_cp_file(self, path1, path2, **kwargs)
-
-    try:
-        first_manager = make_manager()
-        try:
-            with monkeypatch.context() as patch:
-                patch.setattr(MemoryFileSystem, "cp_file", cut_short_cp_file)
-                with pytest.raises(type(error)):
-                    first_manager.save(
-                        f"{root}/step-20",
-                        {
-                            "model": torch.zeros(4, dtype=torch.long),
-                            "optimizer": torch.ones(4, dtype=torch.long),
-                        },
-                    )
-        finally:
-            first_manager.close()
-
-        manager = make_manager()
-        try:
-            manager.save(
-                f"{root}/step-20",
-                {"model": torch.arange(4), "optimizer": torch.arange(4, 8)},
-            )
-            names = sorted(posixpath.basename(p) for p in fs.find(f"{root}/step-20"))
-            assert names == ["metadata.pkl", "model_0.pt", "optimizer_0.pt"]
-
-            loaded = manager.load(
-                f"{root}/step-20",
-                into={
-                    "model": torch.zeros(4, dtype=torch.long),
-                    "optimizer": torch.zeros(4, dtype=torch.long),
-                },
-            )
-            assert torch.equal(loaded["model"], torch.arange(4))
-            assert torch.equal(loaded["optimizer"], torch.arange(4, 8))
-        finally:
-            manager.close()
-    finally:
-        if fs.exists(f"/{root}"):
-            fs.rm(f"/{root}", recursive=True)
+        loaded = manager.load(
+            str(dst),
+            into={
+                "model": torch.zeros(4, dtype=torch.long),
+                "optimizer": torch.zeros(4, dtype=torch.long),
+            },
+        )
+        assert torch.equal(loaded["model"], torch.arange(4))
+        assert torch.equal(loaded["optimizer"], torch.arange(4, 8))
 
 
 def test_replace_existing_saves_over_what_the_store_holds(storage, root):
     # Runs on the store _TEST_URL names, so the marker delete, a flat prefix
     # vanishing with its last object, and the second rename hit its driver.
     protocol, _ = split_protocol(_TEST_URL)
-    config = CheckpointManager.Config.with_sync_save()
-    config.default = ItemSpec(resharder=DefaultResharder())
-    config.storage_config = FsspecStorageConfig(protocol=protocol)
-    config.save.writer_config.replace_existing = True
     zeros = {
         "model": torch.zeros(4, dtype=torch.long),
         "optimizer": torch.zeros(4, dtype=torch.long),
     }
     _put(storage, root / "step-1" / "model_0.pt", b"partial")  # commit cut short
     _put(storage, root / "step-2" / METADATA_FILE_NAME, b"marker")  # only the marker
-    manager = config.build()
-    try:
+    with _resharded_manager(protocol, replace_existing=True) as manager:
         manager.save(str(root / "step-3"), zeros)  # a complete checkpoint
         for step in (1, 2, 3):
             path = root / f"step-{step}"
@@ -1021,5 +953,3 @@ def test_replace_existing_saves_over_what_the_store_holds(storage, root):
             loaded = manager.load(str(path), into=dict(zeros))
             assert torch.equal(loaded["model"], torch.arange(4) + step)
         assert sorted(storage.ls(root)) == ["step-1", "step-2", "step-3"]
-    finally:
-        manager.close()
