@@ -6,6 +6,7 @@
 
 import errno
 import io
+import logging
 import os
 import posixpath
 from dataclasses import dataclass, field
@@ -16,10 +17,13 @@ from typing_extensions import Buffer, override
 
 from .base_storage import (
     _occupied_destination_error,
+    METADATA_FILE_NAME,
     ReadArgs,
     Storage,
     StorageConfig,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -54,6 +58,9 @@ class FsspecStorageConfig(StorageConfig):
 
 # The characters fsspec treats as a glob pattern.
 _GLOB_CHARACTERS = "*?["
+
+# Temporary name under which metadata.pkl travels during a directory rename.
+_HELD_BACK_MARKER_NAME: str = f".{METADATA_FILE_NAME}.tmp"
 
 
 def _reject_glob_characters(path: Path) -> None:
@@ -172,10 +179,21 @@ class FsspecStorage(Storage):
     def _rename_directory(self, src_path: Path, dst_path: Path) -> None:
         """Move a directory so its contents land directly at ``dst_path``.
 
-        The destination check and the driver's move are separate calls. Where
-        the move is a single directory rename, that step is atomic. On a flat
-        object store each object is copied and then deleted, so a failure
-        midway can leave ``dst_path`` partly written.
+        On a flat object store ``mv(..., recursive=True)`` copies and deletes
+        one object at a time rather than renaming a directory atomically. This
+        runs in four steps so ``metadata.pkl`` arrives last:
+
+        1. Check ``dst_path``: raise if occupied, or remove it if it is an
+           empty directory so ``mv`` does not nest ``src_path`` inside it.
+        2. If ``<src>/metadata.pkl`` is a file, move it to
+           ``<src>/.metadata.pkl.tmp``.
+        3. Move ``src_path`` to ``dst_path`` recursively; if this raises,
+           best-effort move ``<src>/.metadata.pkl.tmp`` back to
+           ``<src>/metadata.pkl`` before re-raising.
+        4. If the marker was held back, move ``<dst>/.metadata.pkl.tmp`` to
+           ``<dst>/metadata.pkl``.
+
+        A kill at any point leaves no ``metadata.pkl`` beside a missing file.
         """
         src, dst = str(src_path), str(dst_path)
         if self.exists(dst_path):
@@ -187,7 +205,33 @@ class FsspecStorage(Storage):
             # a directory *into* an existing destination directory, which would
             # nest the contents under dst_path/<basename of src_path>.
             self._fs.rm(dst, recursive=True)
-        self._fs.mv(src, dst, recursive=True)
+        src_marker = str(src_path / METADATA_FILE_NAME)
+        src_held_back = str(src_path / _HELD_BACK_MARKER_NAME)
+        held_back = self._fs.isfile(src_marker)
+        if held_back:
+            self._fs.mv(src_marker, src_held_back)
+        try:
+            self._fs.mv(src, dst, recursive=True)
+        except Exception:
+            if held_back:
+                try:
+                    if self._fs.isfile(src_held_back) and not self._fs.exists(
+                        src_marker
+                    ):
+                        self._fs.mv(src_held_back, src_marker)
+                except Exception as err:
+                    logger.warning(
+                        "Failed to restore %s from %s after failed directory move: %r",
+                        src_marker,
+                        src_held_back,
+                        err,
+                    )
+            raise
+        if held_back:
+            self._fs.mv(
+                str(dst_path / _HELD_BACK_MARKER_NAME),
+                str(dst_path / METADATA_FILE_NAME),
+            )
 
     def _rename_file(self, src_path: Path, dst_path: Path) -> None:
         """Move a file onto ``dst_path``, replacing an existing file."""

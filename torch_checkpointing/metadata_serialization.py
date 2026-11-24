@@ -15,7 +15,7 @@ from pathlib import Path
 
 from .checkpoint_layout import default_torch_layout_info, LayoutInfo
 from .distributed_metadata import DistributedMetadata
-from .storage.base_storage import Storage
+from .storage.base_storage import METADATA_FILE_NAME, Storage
 
 
 class DistributedMetadataFormat(ABC):
@@ -75,10 +75,6 @@ class RankAddressableDistributedMetadataFormat(DistributedMetadataFormat):
     def default_layout_info(item_key: str, rank: int) -> LayoutInfo:
         """Where this format's writer puts ``item_key`` for ``rank`` by default."""
         raise NotImplementedError
-
-
-# The file the native format reads and the checkpoint writer writes.
-METADATA_FILE_NAME: str = "metadata.pkl"
 
 
 class TorchDistributedMetadataFormat(RankAddressableDistributedMetadataFormat):

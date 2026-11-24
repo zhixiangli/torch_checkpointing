@@ -16,6 +16,9 @@ from typing import Protocol
 
 from typing_extensions import Buffer
 
+# The file whose presence marks a checkpoint directory complete.
+METADATA_FILE_NAME: str = "metadata.pkl"
+
 
 def _occupied_destination_error(
     src_path: Path, dst_path: Path, error_number: int = errno.ENOTEMPTY
@@ -223,6 +226,11 @@ class Storage(ABC):
         it, but callers cannot rely on atomicity across all backends: a backend
         that emulates directories with key prefixes has to copy objects one at a
         time, so a failure mid-rename can leave the destination partly written.
+
+        A backend whose directory move is not atomic should make ``metadata.pkl``
+        (``METADATA_FILE_NAME``) the last file to appear at ``dst_path``, so a
+        reader that checks for ``metadata.pkl`` never finds it beside a missing
+        file.
 
         Args:
             src_path: Source path

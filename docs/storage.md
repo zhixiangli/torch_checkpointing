@@ -141,6 +141,10 @@ atomic-write callers ask for that by construction. A nested or merged commit is
 silent data corruption rather than a cosmetic difference, which is why this is
 spelled out rather than left to each backend's judgement.
 
+A backend whose directory move is not atomic should make `metadata.pkl`
+(`METADATA_FILE_NAME`) the last file to appear at `dst_path`, so a reader that
+checks for `metadata.pkl` never finds it beside a missing file.
+
 `rename` also carries two flags used by checkpoint commit logic.
 `is_directory` renames all objects under the source prefix, and
 `background_cleanup` (directory renames only) deletes source objects on a
@@ -363,11 +367,15 @@ and `remap_path` returns the full URI.
 credentials or endpoints. The config must stay picklable, because the async
 save subprocess rebuilds the storage from it.
 
-**Commit is only as atomic as the driver's move.** `rename` checks the
-destination and then calls the driver's move. Where that move is a single
-directory rename, it is atomic. On a flat object store each object is copied
-and then deleted, so a crash midway can leave the final checkpoint directory
-partly written.
+**Commit publishes `metadata.pkl` last.** When renaming a directory, the
+backend holds `metadata.pkl` back as `.metadata.pkl.tmp`, moves the directory,
+and then renames the marker into place, so a reader that checks for
+`metadata.pkl` never finds it beside a missing file. On a flat object store a
+move cut short leaves a directory without `metadata.pkl`; where the driver's
+move is a single directory rename, the directory still exists without its
+marker for the length of one file move. A kill during the last step can leave a
+stray `.metadata.pkl.tmp` beside a complete checkpoint. A checkpoint written
+without a resharder has no `metadata.pkl` and gets no such protection.
 
 **The listing cache is turned off.** Some drivers cache directory listings per
 client and trust them when looking a path up, but other ranks and the save
