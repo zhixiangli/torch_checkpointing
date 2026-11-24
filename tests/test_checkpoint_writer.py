@@ -4,11 +4,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import dataclasses
+import errno
 import json
 import os
 import shutil
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from unittest import mock
@@ -33,6 +36,7 @@ from torch_checkpointing.checkpoint_layout import (
     RawSerialization,
     TorchSerialization,
 )
+from torch_checkpointing.checkpoint_manager import CheckpointManager
 from torch_checkpointing.checkpoint_writer import (
     CallbackArgs,
     CheckpointWriter,
@@ -40,11 +44,19 @@ from torch_checkpointing.checkpoint_writer import (
     CheckpointWriterConfig,
     DEFAULT_TEMP_DIR_PREFIX,
 )
+from torch_checkpointing.config import AsyncCheckpointSaverConfig
 from torch_checkpointing.logging_utils import EventLogger
+from torch_checkpointing.metadata_serialization import METADATA_FILE_NAME
+from torch_checkpointing.staging import CheckpointStagerConfig
+from torch_checkpointing.storage.base_storage import (
+    OccupiedDestinationError,
+    StorageConfig,
+)
 from torch_checkpointing.storage.filesystem import (
     LocalFileSystemStorage,
     LocalFileSystemStorageConfig,
 )
+from torch_checkpointing.storage.fsspec_storage import FsspecStorageConfig
 from torch_checkpointing.types import RankInfo
 
 
@@ -199,6 +211,51 @@ class _ProbeStorageConfig(LocalFileSystemStorageConfig):
         return _ProbeStorage(self)
 
 
+class _RefusingOnceStorage(LocalFileSystemStorage):
+    error: BaseException | None = None
+
+    def rename(
+        self,
+        src_path: Path,
+        dst_path: Path,
+        is_directory: bool = False,
+        background_cleanup: bool = False,
+    ) -> None:
+        if is_directory and self.error is not None:
+            error = self.error
+            self.error = None
+            raise error
+        super().rename(
+            src_path,
+            dst_path,
+            is_directory=is_directory,
+            background_cleanup=background_cleanup,
+        )
+
+
+@dataclass
+class _RefusingOnceStorageConfig(LocalFileSystemStorageConfig):
+    use_direct_io: bool = False
+
+    def create_storage(self) -> _RefusingOnceStorage:
+        return _RefusingOnceStorage(config=self)
+
+
+class _FlatPrefixStorage(LocalFileSystemStorage):
+    def delete(self, path: Path) -> None:
+        super().delete(path)
+        if not any(path.parent.iterdir()):
+            path.parent.rmdir()
+
+
+@dataclass
+class _FlatPrefixStorageConfig(LocalFileSystemStorageConfig):
+    use_direct_io: bool = False
+
+    def create_storage(self) -> _FlatPrefixStorage:
+        return _FlatPrefixStorage(config=self)
+
+
 class TestCheckpointWriterConfig(TestCase):
     def test_default_values(self):
         """Test that CheckpointWriterConfig has the correct default values."""
@@ -278,6 +335,30 @@ class TestCheckpointWriterConfig(TestCase):
         # has no store to meet on and nothing to wait for.
         self.assertIsInstance(writer._barrier, DefaultStoreBarrier)
         writer._barrier.execute_barrier(timeout_secs=0)
+
+    def test_replace_existing_defaults_to_off_and_is_the_last_field(self):
+        self.assertFalse(CheckpointWriterConfig().replace_existing)
+        self.assertEqual(
+            [f.name for f in dataclasses.fields(CheckpointWriterConfig)][-1],
+            "replace_existing",
+        )
+
+    def test_replace_existing_requires_a_temp_dir(self):
+        with pytest.raises(
+            ValueError, match="replace_existing requires write_to_temp_dir=True"
+        ):
+            CheckpointWriterConfig(
+                barrier_config=_NoopBarrierConfig(),
+                write_to_temp_dir=False,
+                replace_existing=True,
+            )
+
+    def test_replace_existing_without_a_barrier_is_rejected(self):
+        with (
+            pytest.warns(UserWarning),
+            pytest.raises(ValueError, match="replace_existing"),
+        ):
+            CheckpointWriterConfig(barrier_config=None, replace_existing=True)
 
 
 class TestCheckpointWriter(TestCase):
@@ -359,6 +440,30 @@ class TestCheckpointWriter(TestCase):
                 ),
             }
         )
+
+    def _replacing_writer(
+        self, *, storage_config: StorageConfig | None = None
+    ) -> CheckpointWriter:
+        if storage_config is None:
+            storage_config = LocalFileSystemStorageConfig(use_direct_io=False)
+        return CheckpointWriter(
+            CheckpointWriterArgs(
+                config=CheckpointWriterConfig(
+                    barrier_config=_NoopBarrierConfig(),
+                    replace_existing=True,
+                ),
+                rank_info=self.rank_info,
+                storage_config=storage_config,
+            )
+        )
+
+    def _populated_final(self, name: str, *, marker: bool = False) -> Path:
+        final_path = Path(self.temp_dir) / name
+        final_path.mkdir()
+        (final_path / "old.bin").write_bytes(b"old")
+        if marker:
+            (final_path / METADATA_FILE_NAME).write_bytes(b"old-marker")
+        return final_path
 
     def tearDown(self):
         # Clean up the temporary directory
@@ -907,6 +1012,398 @@ class TestCheckpointWriter(TestCase):
             # The JSON file contains just the raw value, not wrapped in an object
             self.assertEqual(global_data, "some_global_config_value")
 
+    def test_replace_existing_replaces_a_populated_final_dir(self):
+        for label, storage_config in (
+            ("local", LocalFileSystemStorageConfig(use_direct_io=False)),
+            ("fsspec", FsspecStorageConfig(protocol="memory")),
+        ):
+            with self.subTest(backend=label):
+                final_path = Path(self.temp_dir) / f"checkpoint_{label}"
+                tmp_path = (
+                    Path(self.temp_dir) / f"{DEFAULT_TEMP_DIR_PREFIX}checkpoint_{label}"
+                )
+                writer = self._replacing_writer(storage_config=storage_config)
+                storage = writer._storage
+                try:
+                    storage.mkdir(final_path)
+                    storage.write(final_path / "old.bin", b"old")
+                    storage.write(final_path / METADATA_FILE_NAME, b"old-marker")
+                    with self.assertLogs(
+                        checkpoint_writer_module.__name__, level="WARNING"
+                    ) as logs:
+                        writer.write(str(final_path), self._raw_checkpoint_info())
+                    self.assertTrue(
+                        any(str(final_path) in line for line in logs.output)
+                    )
+                    self.assertEqual(
+                        sorted(storage.ls(final_path)),
+                        ["first.bin", "metadata.bin", "second.bin"],
+                    )
+                    self.assertEqual(storage.read(final_path / "first.bin"), b"first")
+                    self.assertFalse(storage.exists(tmp_path))
+                finally:
+                    if label == "fsspec" and storage.exists(Path(self.temp_dir)):
+                        storage.rmdir(Path(self.temp_dir))
+
+    def test_replace_existing_removes_the_old_marker_before_the_rest(self):
+        final_path = self._populated_final("checkpoint_0013000", marker=True)
+        real_rmdir = LocalFileSystemStorage.rmdir
+
+        def fail_on_final(storage_self, path: Path) -> None:
+            if path == final_path:
+                raise RuntimeError("killed mid-delete")
+            real_rmdir(storage_self, path)
+
+        writer = self._replacing_writer()
+        with (
+            mock.patch.object(LocalFileSystemStorage, "rmdir", fail_on_final),
+            pytest.raises(RuntimeError, match="killed mid-delete"),
+        ):
+            writer.write(str(final_path), self._raw_checkpoint_info())
+
+        self.assertFalse((final_path / METADATA_FILE_NAME).exists())
+        self.assertTrue((final_path / "old.bin").exists())
+
+    def test_replace_existing_touches_nothing_before_the_barrier(self):
+        final_path = self._populated_final("checkpoint_0014000")
+        writer = self._replacing_writer()
+        seen: list[bool] = []
+        barrier = mock.Mock()
+        barrier.execute_barrier.side_effect = lambda _timeout: seen.append(
+            (final_path / "old.bin").exists()
+        )
+        writer._barrier = barrier
+
+        writer.write(str(final_path), self._raw_checkpoint_info())
+
+        self.assertEqual(seen, [True])
+        self.assertFalse((final_path / "old.bin").exists())
+
+    def test_replace_existing_keeps_the_old_dir_when_the_write_fails(self):
+        final_path = self._populated_final("checkpoint_0015000", marker=True)
+        writer = self._replacing_writer()
+
+        with (
+            mock.patch.object(
+                LocalFileSystemStorage, "write", side_effect=OSError("disk full")
+            ),
+            pytest.raises(OSError, match="disk full"),
+        ):
+            writer.write(str(final_path), self._raw_checkpoint_info())
+
+        self.assertEqual(
+            sorted(p.name for p in final_path.iterdir()),
+            [METADATA_FILE_NAME, "old.bin"],
+        )
+
+    def test_only_role_rank_0_replaces_the_destination(self):
+        self.rank_info = RankInfo(
+            global_rank=1, global_world_size=2, role_rank=1, role_world_size=2
+        )
+        final_path = self._populated_final("checkpoint_0016000")
+        writer = self._replacing_writer()
+
+        writer.write(str(final_path), self._raw_checkpoint_info())
+
+        self.assertEqual([p.name for p in final_path.iterdir()], ["old.bin"])
+
+    def test_replace_existing_commits_onto_an_empty_dir_without_deleting(self):
+        final_path = Path(self.temp_dir) / "checkpoint_0017000"
+        final_path.mkdir()
+        rmdir_calls: list[Path] = []
+        real_rmdir = LocalFileSystemStorage.rmdir
+
+        def record_rmdir(storage_self, path: Path) -> None:
+            if path == final_path:
+                rmdir_calls.append(path)
+            real_rmdir(storage_self, path)
+
+        writer = self._replacing_writer()
+        with mock.patch.object(LocalFileSystemStorage, "rmdir", record_rmdir):
+            writer.write(str(final_path), self._raw_checkpoint_info())
+
+        self.assertEqual(rmdir_calls, [])
+        self.assertEqual(
+            sorted(p.name for p in final_path.iterdir()),
+            ["first.bin", "metadata.bin", "second.bin"],
+        )
+
+    def test_replace_existing_survives_a_failed_second_rename(self):
+        final_path = self._populated_final("checkpoint_0018000", marker=True)
+        tmp_path = Path(self.temp_dir) / f"{DEFAULT_TEMP_DIR_PREFIX}checkpoint_0018000"
+        real_rename = LocalFileSystemStorage.rename
+        directory_rename_calls = 0
+
+        def fail_second_directory_rename(
+            storage_self,
+            src_path: Path,
+            dst_path: Path,
+            is_directory: bool = False,
+            background_cleanup: bool = False,
+        ) -> None:
+            nonlocal directory_rename_calls
+            if is_directory:
+                directory_rename_calls += 1
+                if directory_rename_calls == 2:
+                    raise TimeoutError("second rename")
+            real_rename(
+                storage_self,
+                src_path,
+                dst_path,
+                is_directory=is_directory,
+                background_cleanup=background_cleanup,
+            )
+
+        writer = self._replacing_writer()
+        with (
+            mock.patch.object(
+                LocalFileSystemStorage, "rename", fail_second_directory_rename
+            ),
+            pytest.raises(TimeoutError, match="second rename"),
+        ):
+            writer.write(str(final_path), self._raw_checkpoint_info())
+        self.assertFalse(final_path.exists())
+        self.assertEqual(
+            sorted(p.name for p in tmp_path.iterdir()),
+            ["first.bin", "metadata.bin", "second.bin"],
+        )
+        self._replacing_writer().write(str(final_path), self._raw_checkpoint_info())
+        self.assertEqual(
+            sorted(p.name for p in final_path.iterdir()),
+            ["first.bin", "metadata.bin", "second.bin"],
+        )
+
+    def test_replace_existing_replaces_only_after_an_occupied_destination_refusal(
+        self,
+    ):
+        replaced = [
+            OccupiedDestinationError(errno.EEXIST, "x"),
+            OccupiedDestinationError(errno.ENOTEMPTY, "x"),
+        ]
+        propagated = [
+            OccupiedDestinationError(errno.ENOTDIR, "x"),
+            OccupiedDestinationError(errno.EISDIR, "x"),
+            OccupiedDestinationError("no errno"),  # a backend that passed no errno
+            OSError(errno.ENOTEMPTY, "x"),  # a backend that does not use the class
+            FileExistsError(errno.EEXIST, "x"),  # a driver error raised mid-move
+            PermissionError(errno.EACCES, "x"),
+            TimeoutError("cut short"),
+            FileExistsError("no errno"),
+        ]
+        writer = self._replacing_writer(storage_config=_RefusingOnceStorageConfig())
+        storage = writer._storage
+        assert isinstance(storage, _RefusingOnceStorage)
+
+        for index, error in enumerate(replaced):
+            with self.subTest(replaced=index):
+                final_path = self._populated_final(f"replaced_{index}", marker=True)
+                storage.error = error
+                writer.write(str(final_path), self._raw_checkpoint_info())
+                self.assertEqual(
+                    sorted(p.name for p in final_path.iterdir()),
+                    ["first.bin", "metadata.bin", "second.bin"],
+                )
+
+        for index, error in enumerate(propagated):
+            with self.subTest(propagated=index):
+                final_path = self._populated_final(f"propagated_{index}", marker=True)
+                storage.error = error
+                with self.assertRaises(BaseException) as raised:
+                    writer.write(str(final_path), self._raw_checkpoint_info())
+                self.assertIs(raised.exception, error)
+                self.assertEqual(
+                    sorted(p.name for p in final_path.iterdir()),
+                    [METADATA_FILE_NAME, "old.bin"],
+                )
+
+    def test_replace_existing_refuses_a_file_at_the_destination(self):
+        final_path = Path(self.temp_dir) / "checkpoint_file"
+        final_path.write_bytes(b"a file")
+        writer = self._replacing_writer()
+        with pytest.raises(OSError):
+            writer.write(str(final_path), self._raw_checkpoint_info())
+        self.assertEqual(final_path.read_bytes(), b"a file")
+
+    def test_replace_existing_refuses_a_symlink_to_a_checkpoint(self):
+        target = self._populated_final("step-10", marker=True)
+        link = Path(self.temp_dir) / "latest"
+        link.symlink_to(target)
+        writer = self._replacing_writer()
+        with pytest.raises(OSError):
+            writer.write(str(link), self._raw_checkpoint_info())
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(
+            sorted(p.name for p in target.iterdir()),
+            [METADATA_FILE_NAME, "old.bin"],
+        )
+
+    def test_replace_existing_handles_a_marker_only_dir_on_a_flat_store(self):
+        final_path = Path(self.temp_dir) / "checkpoint_marker_only"
+        final_path.mkdir()
+        (final_path / METADATA_FILE_NAME).write_bytes(b"old-marker")
+        writer = self._replacing_writer(storage_config=_FlatPrefixStorageConfig())
+        writer.write(str(final_path), self._raw_checkpoint_info())
+        self.assertEqual(
+            sorted(p.name for p in final_path.iterdir()),
+            ["first.bin", "metadata.bin", "second.bin"],
+        )
+
+    def test_replace_existing_spares_the_destination_when_nothing_was_written(self):
+        final_path = self._populated_final("checkpoint_0014000", marker=True)
+        leftover = final_path.parent / f"{DEFAULT_TEMP_DIR_PREFIX}{final_path.name}"
+        leftover.mkdir()
+        (leftover / "stale.bin").write_bytes(b"stale")
+        with pytest.raises(OSError):
+            self._replacing_writer().write(
+                str(final_path), CheckpointWriteInfo(checkpoint_items={})
+            )
+        self.assertEqual(
+            sorted(p.name for p in final_path.iterdir()),
+            [METADATA_FILE_NAME, "old.bin"],
+        )
+
+    def test_replace_existing_spares_the_destination_when_only_metadata_was_written(
+        self,
+    ):
+        # Rank 0 writes the distributed metadata even with no items, so the
+        # staging directory exists; that alone must not replace a checkpoint.
+        for label, storage_config in (
+            ("local", LocalFileSystemStorageConfig(use_direct_io=False)),
+            ("fsspec", FsspecStorageConfig(protocol="memory")),
+        ):
+            with self.subTest(backend=label):
+                final_path = Path(self.temp_dir) / f"metadata_only_{label}"
+                writer = self._replacing_writer(storage_config=storage_config)
+                storage = writer._storage
+                try:
+                    storage.mkdir(final_path)
+                    storage.write(final_path / "old.bin", b"old")
+                    storage.write(final_path / METADATA_FILE_NAME, b"old-marker")
+                    # Local storage creates no staging directory for a save with
+                    # no items; an interrupted save may have left one.
+                    storage.mkdir(
+                        final_path.parent
+                        / f"{DEFAULT_TEMP_DIR_PREFIX}{final_path.name}"
+                    )
+                    with pytest.raises(OccupiedDestinationError):
+                        writer.write(
+                            str(final_path),
+                            CheckpointWriteInfo(
+                                checkpoint_items={},
+                                serialized_distributed_metadata=b"meta",
+                            ),
+                        )
+                    self.assertEqual(
+                        sorted(storage.ls(final_path)), [METADATA_FILE_NAME, "old.bin"]
+                    )
+                    self.assertEqual(
+                        storage.read(final_path / METADATA_FILE_NAME), b"old-marker"
+                    )
+                finally:
+                    if label == "fsspec" and storage.exists(Path(self.temp_dir)):
+                        storage.rmdir(Path(self.temp_dir))
+
+    def test_replace_existing_reports_the_replacement_apart_from_the_rename(self):
+        final_path = self._populated_final("checkpoint_metric", marker=True)
+        real_rmdir = LocalFileSystemStorage.rmdir
+
+        def slow_rmdir(storage_self, path: Path) -> None:
+            if path == final_path:
+                time.sleep(0.5)
+            real_rmdir(storage_self, path)
+
+        def metrics(info: mock.Mock) -> dict[str, int]:
+            return {
+                call.kwargs["extra"]["metric_name"].rsplit(".execute.", 1)[-1]: (
+                    call.kwargs["extra"]["value"]
+                )
+                for call in info.call_args_list
+                if call.kwargs.get("extra", {}).get("metric_name")
+            }
+
+        with (
+            mock.patch.object(LocalFileSystemStorage, "rmdir", slow_rmdir),
+            mock.patch.object(checkpoint_writer_module.logger, "info") as info,
+        ):
+            self._replacing_writer().write(str(final_path), self._raw_checkpoint_info())
+        replaced = metrics(info)
+        self.assertGreaterEqual(replaced["replace_existing.latency_ms"], 500)
+        self.assertLess(replaced["rename.latency_ms"], 500)
+
+        with mock.patch.object(checkpoint_writer_module.logger, "info") as info:
+            self._replacing_writer().write(
+                str(Path(self.temp_dir) / "checkpoint_metric_fresh"),
+                self._raw_checkpoint_info(),
+            )
+        fresh = metrics(info)
+        self.assertIn("rename.latency_ms", fresh)
+        self.assertNotIn("replace_existing.latency_ms", fresh)
+
+    def test_without_replace_existing_the_refusal_propagates_after_one_rename(self):
+        final_path = self._populated_final("checkpoint_0019000", marker=True)
+        writer = self._writer(_ConcurrencyProbe(1), barrier_config=_NoopBarrierConfig())
+
+        with pytest.raises(FileExistsError) as raised:
+            writer.write(str(final_path), self._raw_checkpoint_info())
+
+        self.assertEqual(raised.value.errno, errno.ENOTEMPTY)
+        self.assertIn("the destination is occupied", str(raised.value))
+        self.assertEqual(len(writer._storage._config.rename_calls), 1)
+        self.assertEqual(
+            sorted(p.name for p in final_path.iterdir()),
+            [METADATA_FILE_NAME, "old.bin"],
+        )
+
+    def test_replace_existing_refuses_a_symlink_on_the_fsspec_file_driver(self):
+        target = self._populated_final("step-10", marker=True)
+        link = Path(self.temp_dir) / "latest"
+        link.symlink_to(target)
+        writer = self._replacing_writer(
+            storage_config=FsspecStorageConfig(protocol="file")
+        )
+
+        with pytest.raises(FileExistsError):
+            writer.write(str(link), self._raw_checkpoint_info())
+
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(
+            sorted(p.name for p in target.iterdir()), [METADATA_FILE_NAME, "old.bin"]
+        )
+
+    def test_replace_existing_removes_nested_directories(self):
+        final_path = self._populated_final("checkpoint_0020000", marker=True)
+        (final_path / "sharded").mkdir()
+        (final_path / "sharded" / "model_0.safetensors").write_bytes(b"old")
+
+        self._replacing_writer().write(str(final_path), self._raw_checkpoint_info())
+
+        self.assertEqual(
+            sorted(p.name for p in final_path.iterdir()),
+            ["first.bin", "metadata.bin", "second.bin"],
+        )
+
+    def test_replace_existing_recovers_from_an_interrupted_delete(self):
+        final_path = self._populated_final("checkpoint_0021000", marker=True)
+        real_rmdir = LocalFileSystemStorage.rmdir
+
+        def fail_on_final(storage_self, path: Path) -> None:
+            if path == final_path:
+                raise RuntimeError("killed mid-delete")
+            real_rmdir(storage_self, path)
+
+        with (
+            mock.patch.object(LocalFileSystemStorage, "rmdir", fail_on_final),
+            pytest.raises(RuntimeError, match="killed mid-delete"),
+        ):
+            self._replacing_writer().write(str(final_path), self._raw_checkpoint_info())
+        self.assertEqual([p.name for p in final_path.iterdir()], ["old.bin"])
+
+        self._replacing_writer().write(str(final_path), self._raw_checkpoint_info())
+        self.assertEqual(
+            sorted(p.name for p in final_path.iterdir()),
+            ["first.bin", "metadata.bin", "second.bin"],
+        )
+
 
 def test_generic_pre_write_receives_active_storage_and_final_path_before_creation(
     tmp_path,
@@ -932,6 +1429,33 @@ def test_generic_pre_write_receives_active_storage_and_final_path_before_creatio
     writer = CheckpointWriter(args)
     writer.write(str(path), CheckpointWriteInfo(checkpoint_items={}))
     assert received == [(str(path), writer._storage, False, False)]
+
+
+def test_async_save_replaces_the_same_path_twice(tmp_path: Path) -> None:
+    config = CheckpointManager.Config(
+        save=AsyncCheckpointSaverConfig(
+            writer_config=CheckpointWriterConfig(replace_existing=True),
+            staging_config=CheckpointStagerConfig(
+                use_pinned_memory=False,
+                use_non_blocking_copy=False,
+            ),
+            wait_timeout_secs=30,
+        ),
+        storage_config=LocalFileSystemStorageConfig(use_direct_io=False),
+    )
+    manager = config.build()
+    path = os.path.join(tmp_path, "checkpoint")
+    try:
+        first_future = manager.save(path, {"model": torch.zeros(4), "step": 1})
+        assert first_future is not None
+        first_future.result(timeout=30)
+        second_future = manager.save(path, {"model": torch.ones(4), "step": 2})
+        assert second_future is not None
+        second_future.result(timeout=30)
+        loaded = manager.load(path, into={"model": torch.zeros(4), "step": 0})
+        assert loaded["step"] == 2 and torch.equal(loaded["model"], torch.ones(4))
+    finally:
+        manager.close()
 
 
 if __name__ == "__main__":

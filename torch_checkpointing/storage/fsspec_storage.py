@@ -200,7 +200,10 @@ class FsspecStorage(Storage):
             if not self.isdir(dst_path):
                 raise _occupied_destination_error(src_path, dst_path, errno.ENOTDIR)
             if self.ls(dst_path):
-                raise _occupied_destination_error(src_path, dst_path, errno.ENOTEMPTY)
+                error = _occupied_destination_error(src_path, dst_path, errno.ENOTEMPTY)
+                if self._fs.info(dst).get("islink"):
+                    raise FileExistsError(*error.args)
+                raise error
             # An empty destination is unoccupied. Remove it first: fsspec moves
             # a directory *into* an existing destination directory, which would
             # nest the contents under dst_path/<basename of src_path>.

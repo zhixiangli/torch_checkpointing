@@ -12,6 +12,7 @@ determining checkpoint layout, configuring the writer, and defining hooks
 for custom actions during the checkpoint writing process.
 """
 
+import errno
 import json
 import logging
 import warnings
@@ -34,10 +35,11 @@ from .checkpoint_layout import (
 )
 from .logging_utils import EventLogger, EventType, get_log_event_type_for_file_save
 from .metadata_serialization import METADATA_FILE_NAME
-from .storage.base_storage import Storage, StorageConfig
+from .storage.base_storage import OccupiedDestinationError, Storage, StorageConfig
 from .types import RankInfo
 
 DEFAULT_TEMP_DIR_PREFIX = "tmp_"
+_POPULATED_DESTINATION_ERRNOS = frozenset({errno.EEXIST, errno.ENOTEMPTY})
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +67,15 @@ class CheckpointWriterConfig:
             directory and rename it onto the final path once every rank has finished.
             Defaults to True. If false, writer will write directly to the final path.
             Requires a barrier to be configured when True.
+        replace_existing: Replaces a populated directory at the destination when
+            committing. Rank 0 deletes its ``metadata.pkl`` first, then the
+            directory, after every rank has written and passed the barrier; a
+            failure before that leaves the destination untouched. The delete and
+            the rename are separate steps, so a crash between them leaves no
+            checkpoint at the destination. Rank 0 replaces only when it wrote
+            at least one item, so a save of no items, which writes only
+            ``metadata.pkl``, never replaces a checkpoint. Requires
+            ``write_to_temp_dir=True``. Defaults to False.
     """
 
     checkpoint_write_barrier_timeout_sec: int = 600
@@ -74,6 +85,7 @@ class CheckpointWriterConfig:
     file_write_max_threads: int = 1
     temp_dir_prefix: str = DEFAULT_TEMP_DIR_PREFIX
     write_to_temp_dir: bool = True
+    replace_existing: bool = False
 
     def __post_init__(self) -> None:
         if self.file_write_max_threads < 1:
@@ -83,6 +95,8 @@ class CheckpointWriterConfig:
             logger.warning(msg)
             warnings.warn(msg, stacklevel=2)
             self.write_to_temp_dir = False
+        if self.replace_existing and not self.write_to_temp_dir:
+            raise ValueError("replace_existing requires write_to_temp_dir=True")
         if self.write_to_temp_dir and not self.temp_dir_prefix:
             raise ValueError(
                 "temp_dir_prefix must be non-empty when writing to a temp dir"
@@ -314,7 +328,12 @@ class CheckpointWriter:
             and self._args.rank_info.role_rank == 0
         ):
             logger.info("Moving checkpoint to final directory")
-            self._storage.rename(tmp_dir_path, final_path, is_directory=True)
+            self._commit(
+                tmp_dir_path,
+                final_path,
+                wrote_files=bool(save_items),
+                event_logger=event_logger,
+            )
             logger.info(
                 "Finished moving checkpoint to final directory",
                 extra=event_logger(
@@ -339,6 +358,41 @@ class CheckpointWriter:
         )
 
         return None
+
+    def _commit(
+        self,
+        tmp_dir_path: Path,
+        final_path: Path,
+        *,
+        wrote_files: bool,
+        event_logger: EventLogger,
+    ) -> None:
+        try:
+            self._storage.rename(tmp_dir_path, final_path, is_directory=True)
+            return
+        except OccupiedDestinationError as error:
+            if not (
+                self._args.config.replace_existing
+                and wrote_files
+                and error.errno in _POPULATED_DESTINATION_ERRNOS
+            ):
+                raise
+        logger.warning("Replacing existing checkpoint directory %s.", final_path)
+        marker = final_path / METADATA_FILE_NAME
+        if self._storage.exists(marker):
+            self._storage.delete(marker)
+        if self._storage.exists(
+            final_path
+        ):  # a flat prefix vanishes with its last object
+            self._storage.rmdir(final_path)
+        logger.info(
+            "Removed the checkpoint being replaced",
+            extra=event_logger(
+                EventType.LOG_METRIC,
+                metric_name=f"{self._metric_prefix}.execute.replace_existing.latency_ms",
+            ),
+        )
+        self._storage.rename(tmp_dir_path, final_path, is_directory=True)
 
     def _write_keys(
         self,

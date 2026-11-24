@@ -202,6 +202,7 @@ class CheckpointWriterConfig:
     )
     file_write_max_threads: int = 1
     write_to_temp_dir: bool = True
+    replace_existing: bool = False
 ```
 
 `DefaultStoreBarrierConfig` is the default because it costs nothing to hold: it
@@ -220,6 +221,17 @@ By default, inside `CheckpointWriter.write()` the ordering is:
    finish writing.
 5. On `role_rank == 0`, atomically rename the temporary directory to the final
    path.
+
+   When `replace_existing=True` (which requires `write_to_temp_dir=True`), if
+   that rename is refused with `OccupiedDestinationError` because the
+   destination is a populated directory, `role_rank == 0` deletes the
+   destination's `metadata.pkl` first, removes the destination directory, and
+   retries the rename. Because replacement runs only after step 4, an error
+   while writing or waiting at the barrier leaves the existing checkpoint
+   untouched; however, the delete and the rename are separate steps, so a crash
+   between them leaves no checkpoint at the path (the staged files remain in the
+   temporary directory).
+
 6. Run `finalize_callback`.
 
 The temporary-directory-then-rename dance is what makes a checkpoint atomic:

@@ -106,7 +106,7 @@ def mkdir(self, path: Path, recursive: bool = True) -> None:
     """Create a directory."""
 
 def rmdir(self, path: Path) -> None:
-    """Remove a directory."""
+    """Remove a directory and everything in it."""
 
 def rename(
     self,
@@ -140,6 +140,15 @@ of being merged into or deleted. Only file-onto-file is a replace, because the
 atomic-write callers ask for that by construction. A nested or merged commit is
 silent data corruption rather than a cosmetic difference, which is why this is
 spelled out rather than left to each backend's judgement.
+
+An occupied destination is refused with `OccupiedDestinationError`, a
+`FileExistsError`, and only before anything has been changed. Its errno says
+how: `ENOTEMPTY` or `EEXIST` for a populated directory, `ENOTDIR` or `EISDIR`
+otherwise. `CheckpointWriterConfig(replace_existing=True)` removes a destination
+only after that error with `ENOTEMPTY` or `EEXIST`, so a failure once a move has
+started must raise something else, and an `OccupiedDestinationError` without an
+errno is never replaced. `FsspecStorage` raises the plain `FileExistsError` for a
+destination that is a symlink, so a linked directory is never removed.
 
 A backend whose directory move is not atomic should make `metadata.pkl`
 (`METADATA_FILE_NAME`) the last file to appear at `dst_path`, so a reader that

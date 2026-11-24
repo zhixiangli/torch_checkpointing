@@ -20,16 +20,27 @@ from typing_extensions import Buffer
 METADATA_FILE_NAME: str = "metadata.pkl"
 
 
+class OccupiedDestinationError(FileExistsError):
+    """A rename refused an occupied destination before changing anything.
+
+    Pass the errno first: ``ENOTEMPTY`` or ``EEXIST`` for a populated
+    directory, ``ENOTDIR`` or ``EISDIR`` otherwise.
+    ``CheckpointWriterConfig(replace_existing=True)`` replaces the destination
+    only for ``ENOTEMPTY`` and ``EEXIST``, so an error without an errno is
+    never replaced.
+    """
+
+
 def _occupied_destination_error(
     src_path: Path, dst_path: Path, error_number: int = errno.ENOTEMPTY
-) -> FileExistsError:
+) -> OccupiedDestinationError:
     """The error for a destination a rename is not allowed to consume.
 
     ``error_number`` is carried over from the syscall that refused, so the errno
     still says which way it was occupied (``ENOTEMPTY`` a populated directory,
     ``EISDIR`` a directory where a file was going, ``ENOTDIR`` the reverse).
     """
-    return FileExistsError(
+    return OccupiedDestinationError(
         error_number,
         f"Refusing to rename {src_path} onto {dst_path}: the destination is "
         "occupied, and a rename commits onto unoccupied space rather than "
@@ -172,7 +183,7 @@ class Storage(ABC):
 
     @abstractmethod
     def rmdir(self, path: Path) -> None:
-        """Remove a directory."""
+        """Remove a directory and everything in it."""
         pass
 
     @abstractmethod
@@ -217,6 +228,16 @@ class Storage(ABC):
         ending up with half of each. Only a file onto a file is a replace — that
         is an overwrite the atomic-write callers ask for by construction.
 
+        An occupied destination is refused with ``OccupiedDestinationError``, a
+        ``FileExistsError``, and only before anything has been changed. Its
+        errno says how: ``ENOTEMPTY`` or ``EEXIST`` for a populated directory,
+        ``ENOTDIR`` or ``EISDIR`` otherwise.
+        ``CheckpointWriterConfig(replace_existing=True)`` removes a destination
+        only after that error with ``ENOTEMPTY`` or ``EEXIST``, so a failure
+        once a move has started must raise something else. ``FsspecStorage``
+        raises the plain ``FileExistsError`` for a destination that is a
+        symlink, so a linked directory is never removed.
+
         Note the empty-directory row is a POSIX convenience, not a universal:
         some backends refuse a rename onto *any* existing directory. A backend
         that cannot replace an empty destination should raise rather than emulate
@@ -241,7 +262,8 @@ class Storage(ABC):
                 on the low-priority cleanup. Only applies to directory renames.
 
         Raises:
-            OSError: If the destination is occupied, per the table above.
+            OccupiedDestinationError: If the destination is occupied, per the
+                table above.
         """
         pass
 

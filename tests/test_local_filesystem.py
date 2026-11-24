@@ -21,7 +21,10 @@ import pytest
 import torch
 from torch.testing._internal.common_utils import TestCase
 from torch_checkpointing.storage import filesystem
-from torch_checkpointing.storage.base_storage import ReadArgs
+from torch_checkpointing.storage.base_storage import (
+    OccupiedDestinationError,
+    ReadArgs,
+)
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
 from typing_extensions import Buffer
 
@@ -536,3 +539,33 @@ def test_direct_io_refusal_covers_reads_and_writes(
 
     # The refusal in one direction stops O_DIRECT attempts in the other.
     assert direct_opens == [str(path)]
+
+
+def _populated(path: Path, name: str) -> Path:
+    path.mkdir()
+    (path / name).write_bytes(b"data")
+    return path
+
+
+def test_refused_directory_rename_raises_occupied_destination_error(tmp_path):
+    storage = LocalFileSystemStorageConfig(use_direct_io=False).create_storage()
+    src = _populated(tmp_path / "src", "a.bin")
+    dst = _populated(tmp_path / "dst", "b.bin")
+
+    with pytest.raises(OccupiedDestinationError) as raised:
+        storage.rename(src, dst, is_directory=True)
+
+    assert raised.value.errno == errno.ENOTEMPTY
+
+
+def test_symlink_destination_is_refused_as_not_a_directory(tmp_path):
+    storage = LocalFileSystemStorageConfig(use_direct_io=False).create_storage()
+    src = _populated(tmp_path / "src", "a.bin")
+    target = _populated(tmp_path / "real", "b.bin")
+    (tmp_path / "link").symlink_to(target)
+
+    with pytest.raises(OccupiedDestinationError) as raised:
+        storage.rename(src, tmp_path / "link", is_directory=True)
+
+    assert raised.value.errno == errno.ENOTDIR
+    assert sorted(p.name for p in target.iterdir()) == ["b.bin"]
